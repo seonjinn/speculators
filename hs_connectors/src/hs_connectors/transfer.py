@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import fcntl
+import math
 import os
 import shutil
 import socket
@@ -122,10 +123,13 @@ class HiddenStatesBackend(ABC):
 # ---------------------------------------------------------------------------
 
 
-def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
+def _load_hs_file(
+    file_path: Path,
+    lock_timeout: float = 10.0,
+) -> dict[str, torch.Tensor] | None:
     lock_path = str(file_path) + ".lock"
     if Path(lock_path).exists():
-        wait_for_lock(lock_path)
+        wait_for_lock(lock_path, timeout=lock_timeout)
 
     if file_path.exists():
         return load_file(file_path)
@@ -136,15 +140,22 @@ def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
 class FileTransfer(HiddenStatesTransfer):
     """File-system based hidden-states transfer (shared filesystem)."""
 
-    def __init__(self, hidden_states_path: Path):
+    def __init__(
+        self,
+        hidden_states_path: Path,
+        lock_timeout: float = 10.0,
+    ) -> None:
+        if not math.isfinite(lock_timeout) or lock_timeout <= 0:
+            raise ValueError("lock_timeout must be finite and positive")
         self.hidden_states_path = hidden_states_path
+        self.lock_timeout = lock_timeout
 
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        return _load_hs_file(path)
+        return _load_hs_file(path, lock_timeout=self.lock_timeout)
 
     def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
-        return _load_hs_file(Path(handle))
+        return _load_hs_file(Path(handle), lock_timeout=self.lock_timeout)
 
     def cache(self, handle: str, file_idx: int) -> None:
         self.hidden_states_path.mkdir(parents=True, exist_ok=True)
@@ -170,6 +181,12 @@ class FileBackend(HiddenStatesBackend):
                 "args.data_path / 'hidden_states')"
             ),
         )
+        parser.add_argument(
+            "--hidden-states-lock-timeout",
+            type=float,
+            default=10.0,
+            help="Seconds to wait for an asynchronously written hidden-state file.",
+        )
 
     @staticmethod
     def add_launch_args(parser: argparse.ArgumentParser) -> None:
@@ -190,7 +207,10 @@ class FileBackend(HiddenStatesBackend):
             if args.hidden_states_path
             else Path(data_path) / "hidden_states"
         )
-        return FileTransfer(hs_path)
+        return FileTransfer(
+            hs_path,
+            lock_timeout=getattr(args, "hidden_states_lock_timeout", 10.0),
+        )
 
     @staticmethod
     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:

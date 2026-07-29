@@ -301,6 +301,8 @@ class ArrowDataset(BaseDataset):
                     self.transfer.cache(handle, file_idx)
                 case "delete":
                     self.transfer.delete(handle)
+        except TimeoutError:
+            raise
         except Exception as e:
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
