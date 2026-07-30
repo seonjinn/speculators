@@ -52,8 +52,9 @@ def test_token_counts_stay_balanced_across_ranks(replicas):
 
 
 @pytest.mark.parametrize("replicas", [2, 3, 4, 8])
-def test_ranks_form_a_disjoint_partition(replicas):
-    lengths = _skewed_lengths()
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_ranks_form_a_disjoint_partition(replicas, seed):
+    lengths = _skewed_lengths(seed=seed)
     shards = _shards(lengths, replicas)
 
     seen: list[set[int]] = []
@@ -65,6 +66,7 @@ def test_ranks_form_a_disjoint_partition(replicas):
     for i in range(replicas):
         for j in range(i + 1, replicas):
             assert not (seen[i] & seen[j]), f"ranks {i}/{j} share samples"
+    assert set().union(*seen) == set(range(len(lengths)))
 
 
 @pytest.mark.parametrize("replicas", [2, 3, 4, 8])
@@ -99,3 +101,47 @@ def test_rotation_actually_moves_the_largest_sample_off_rank_zero():
         owners.add(best_rank)
 
     assert len(owners) > 1, "largest sample always lands on the same rank"
+
+
+def test_final_tail_is_rebalanced_without_dropping_samples():
+    lengths = np.ones(10, dtype=np.int64)
+    replicas = 4
+    shards = [
+        list(
+            iter(
+                MultipackDistributedBatchSamplerV2(
+                    batch_max_length=2,
+                    lengths=lengths,
+                    num_replicas=replicas,
+                    rank=rank,
+                )
+            )
+        )
+        for rank in range(replicas)
+    ]
+
+    flattened = [
+        int(index)
+        for rank_batches in shards
+        for batch in rank_batches
+        for index in batch
+    ]
+    assert sorted(flattened) == list(range(len(lengths)))
+    assert len(flattened) == len(set(flattened))
+    assert {len(rank_batches) for rank_batches in shards} == {2}
+    for rank_batches in shards:
+        for batch in rank_batches:
+            assert len(batch) > 0
+            assert int(lengths[batch].sum()) <= 2
+
+
+def test_unrepresentable_final_tail_fails_instead_of_dropping_samples():
+    sampler = MultipackDistributedBatchSamplerV2(
+        batch_max_length=1,
+        lengths=np.ones(6, dtype=np.int64),
+        num_replicas=4,
+        rank=0,
+    )
+
+    with pytest.raises(ValueError, match="cannot rebalance final sampler tail"):
+        list(iter(sampler))
