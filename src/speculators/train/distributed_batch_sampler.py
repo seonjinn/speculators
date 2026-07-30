@@ -94,6 +94,55 @@ def _lpt_packed_batch(
     return local_batch
 
 
+def _rebalance_final_tail(
+    lengths: np.ndarray,
+    max_len: int,
+    rank: int,
+    replicas: int,
+    last_batch_indices: NDArray | None,
+    tail_indices: NDArray,
+    tail_rotation: int,
+) -> tuple[NDArray, NDArray]:
+    if last_batch_indices is None:
+        raise ValueError("cannot rebalance final sampler tail without a previous batch")
+
+    move_count = replicas - len(tail_indices)
+    if len(last_batch_indices) - move_count < replicas:
+        raise ValueError(
+            "cannot rebalance final sampler tail while keeping every rank nonempty"
+        )
+
+    move_order = np.argsort(lengths[last_batch_indices], kind="stable")
+    moved_indices = last_batch_indices[move_order[:move_count]]
+    retained_indices = last_batch_indices[move_order[move_count:]]
+    rebalanced_tail = np.concatenate((tail_indices, moved_indices))
+
+    previous_batch = _lpt_packed_batch(
+        lengths[retained_indices],
+        max_len,
+        replicas,
+        0,
+        rank,
+        tail_rotation - 1,
+    )
+    tail_batch = _lpt_packed_batch(
+        lengths[rebalanced_tail],
+        max_len,
+        replicas,
+        0,
+        rank,
+        tail_rotation,
+    )
+    if previous_batch is None or tail_batch is None:
+        raise ValueError("cannot rebalance final sampler tail within the token budget")
+    if not previous_batch or not tail_batch:
+        raise ValueError(
+            "cannot rebalance final sampler tail while keeping every rank nonempty"
+        )
+
+    return retained_indices[previous_batch], rebalanced_tail[tail_batch]
+
+
 def _assign_to_packed_batches(
     lengths: np.ndarray, max_len: int, rank: int, replicas: int
 ) -> list[NDArray]:
@@ -107,28 +156,41 @@ def _assign_to_packed_batches(
         replicas (int): world size to distribute batches to
 
     Returns:
-        tuple[list, int, int]:
-            - list of np.arrays containing the indices for each batch on this rank
-            - sum of dataset lengths included (total sum of lengths in dataset minus any
-              that were dropped at end of dataset)
-            - total token capacity if each batch maxed out max_length
+        A list of index arrays, one per global batch, for this rank. Every
+        valid sample is included exactly once across ranks. A final tail that
+        cannot be rebalanced without empty ranks or exceeding ``max_len``
+        raises ``ValueError`` instead of being silently dropped.
     """
 
     lengths_so_far = 0
     ind = 0
     result: list = []
     lengths_cumsum = np.cumsum(lengths)
+    last_batch_indices: NDArray | None = None
 
     # binary search for max integer x such that the next x elements in shuffled lengths
     # array can be packed into `replicas` batches.
     # Add this rank's batch to `result` and repeat until end of dataset
     while True:
         if len(lengths) - ind < replicas:
-            # Not enough lengths left to pack into `num_replicas` batches
-            # Break and drop whatever lengths we have left
+            tail_indices = np.arange(ind, len(lengths))
+            if len(tail_indices) == 0:
+                break
+            previous_batch, tail_batch = _rebalance_final_tail(
+                lengths,
+                max_len,
+                rank,
+                replicas,
+                last_batch_indices,
+                tail_indices,
+                len(result),
+            )
+            result[-1] = previous_batch
+            result.append(tail_batch)
             break
 
         # binary search in [1, 1 + upper bound for x)
+        batch_start = ind
         left = 1
         right = 1 + np.searchsorted(
             lengths_cumsum[ind:], lengths_so_far + max_len * replicas, "right"
@@ -155,6 +217,7 @@ def _assign_to_packed_batches(
 
         ind += left
         lengths_so_far = lengths_cumsum[ind - 1]
+        last_batch_indices = np.arange(batch_start, ind)
 
         # append only result for this rank (already filtered in lpt_packed_batch)
         result.append(batch)
