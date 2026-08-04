@@ -13,6 +13,7 @@ from datasets import concatenate_datasets, load_dataset
 from packaging.version import Version
 from transformers import (
     AutoProcessor,
+    AutoTokenizer,
     BatchEncoding,
     BatchFeature,
     PreTrainedTokenizerBase,
@@ -813,10 +814,18 @@ def _resolve_pad_token(processor: ProcessorLike):
 
 
 def load_processor(target_model_path: str, *, trust_remote_code: bool = False):
-    processor = AutoProcessor.from_pretrained(
-        target_model_path,
-        trust_remote_code=trust_remote_code,
-    )
+    try:
+        processor = AutoProcessor.from_pretrained(
+            target_model_path,
+            trust_remote_code=trust_remote_code,
+        )
+    except ValueError as error:
+        if "Unrecognized processing class" not in str(error):
+            raise
+        processor = AutoTokenizer.from_pretrained(
+            target_model_path,
+            trust_remote_code=trust_remote_code,
+        )
     _resolve_pad_token(processor)
 
     return processor

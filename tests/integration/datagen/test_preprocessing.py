@@ -178,6 +178,54 @@ def test_adapt_conv_for_hf_text_only_processor():
     assert result == conv
 
 
+def test_load_processor_falls_back_to_tokenizer_for_text_only_model():
+    """Use AutoTokenizer only when Transformers reports no processor class."""
+
+    with (
+        patch(
+            "speculators.data_generation.preprocessing.AutoProcessor.from_pretrained",
+            side_effect=ValueError("Unrecognized processing class in text model"),
+        ) as auto_processor,
+        patch(
+            "speculators.data_generation.preprocessing.AutoTokenizer.from_pretrained"
+        ) as auto_tokenizer,
+    ):
+        tokenizer = auto_tokenizer.return_value
+        tokenizer.pad_token = None
+        tokenizer.eos_token = "<eos>"
+
+        processor = load_processor("local-text-model", trust_remote_code=True)
+
+    assert processor is tokenizer
+    assert tokenizer.pad_token == "<eos>"
+    auto_processor.assert_called_once_with(
+        "local-text-model",
+        trust_remote_code=True,
+    )
+    auto_tokenizer.assert_called_once_with(
+        "local-text-model",
+        trust_remote_code=True,
+    )
+
+
+def test_load_processor_does_not_hide_other_processor_errors():
+    """Keep malformed or unsafe processor failures fail-closed."""
+
+    with (
+        patch(
+            "speculators.data_generation.preprocessing.AutoProcessor.from_pretrained",
+            side_effect=ValueError("invalid processor configuration"),
+        ),
+        patch(
+            "speculators.data_generation.preprocessing.AutoTokenizer.from_pretrained"
+        ) as auto_tokenizer,
+        pytest.raises(ValueError, match="invalid processor configuration"),
+    ):
+        load_processor("broken-model")
+
+    auto_tokenizer.assert_not_called()
+
+
 @pytest.mark.sanity
 def test_adapt_conv_for_hf_multimodal_processor():
     """
