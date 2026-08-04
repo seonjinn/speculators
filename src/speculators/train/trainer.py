@@ -466,7 +466,14 @@ class Trainer:
             timer.mark("fwd")
             self._optimizers_zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            grad_norm_metric = None
+            if timer.enabled:
+                grad_norm_metric = grad_norm.detach().to(dtype=torch.float64)
+                if not torch.isfinite(grad_norm_metric).item():
+                    raise FloatingPointError(
+                        f"gradient norm is not finite: {grad_norm_metric.item()}"
+                    )
 
             timer.mark("bwd")
             self._optimizers_step()
@@ -479,7 +486,8 @@ class Trainer:
             t_before_fetch = timer.now() or time.perf_counter()
 
             profile = None
-            if timer.enabled:
+            if timer.enabled and grad_norm_metric is not None:
+                metrics["grad_norm"] = grad_norm_metric
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
                 if self.is_distributed:
