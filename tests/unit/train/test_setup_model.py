@@ -12,8 +12,10 @@ Covers:
 """
 
 import copy
+import hashlib
 import os
 import tempfile
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,6 +32,9 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from speculators import SpeculatorsConfig, VerifierConfig
 from speculators.models.eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
+from speculators.train import checkpointer as checkpointer_module
+from speculators.train import distributed as distributed_module
+from speculators.train import trainer as trainer_module
 from speculators.train.checkpointer import (
     DistributedCheckpointer,
     SingleGPUCheckpointer,
@@ -157,6 +162,18 @@ def _param_checksums(state_dict: dict[str, torch.Tensor]) -> dict[str, float]:
         for k, v in state_dict.items()
         if isinstance(v, torch.Tensor)
     }
+
+
+def _parameter_sha256(model: torch.nn.Module) -> str:
+    """Hash trainable parameters in a stable order for DDP resume checks."""
+    digest = hashlib.sha256()
+    for name, parameter in sorted(model.named_parameters()):
+        if parameter.requires_grad:
+            digest.update(name.encode())
+            digest.update(
+                parameter.detach().cpu().float().contiguous().numpy().tobytes()
+            )
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +637,284 @@ def test_ddp_fresh_init(tmp_path):
 # ===================================================================
 # Distributed — Resume from Checkpoint
 # ===================================================================
+
+
+def _cpu_gloo_setup(rank: int, world_size: int, init_file: str) -> None:
+    """Initialize an isolated CPU process group for the DDP resume regression."""
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    distributed_module._rank = rank
+    distributed_module._world_size = world_size
+    distributed_module._is_distributed = True
+
+
+def _fill_trainable_parameters(model: torch.nn.Module, value: float) -> None:
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.fill_(value)
+
+
+def _make_seeded_tiny_model(seed: int) -> Eagle3DraftModel:
+    torch.manual_seed(seed)
+    return _make_tiny_model()
+
+
+class _ResumeBatchSampler:
+    """Deterministic sampler exposing Trainer's fast-resume interface."""
+
+    def __init__(self) -> None:
+        self.all_batches = [[101], [103], [107], [109], [113], [127], [131], [137]]
+        self.epoch = 0
+        self._cached_generated_batches: tuple[int, list[list[int]]] = (-1, [])
+
+    def __iter__(self):
+        yield from self._generate_batches(self.epoch)
+
+    def __len__(self) -> int:
+        return len(self._generate_batches(self.epoch))
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _generate_batches(self, epoch: int) -> list[list[int]]:
+        if self._cached_generated_batches[0] != epoch:
+            self._cached_generated_batches = (epoch, list(self.all_batches))
+        return self._cached_generated_batches[1]
+
+
+class _ResumeLoader:
+    def __init__(self, sampler: _ResumeBatchSampler) -> None:
+        self.batch_sampler = sampler
+
+    def __len__(self) -> int:
+        return len(self.batch_sampler)
+
+
+def _run_synthetic_steps(trainer: Trainer, stop_global_step: int) -> None:
+    """Advance a Trainer's actual optimizer/scheduler with deterministic gradients."""
+    while trainer.global_step < stop_global_step:
+        for parameter in trainer.model.parameters():
+            if parameter.requires_grad:
+                parameter.grad = torch.full_like(
+                    parameter, (trainer.global_step + 1) / 100.0
+                )
+        trainer._optimizers_step()
+        trainer._schedulers_step()
+        trainer._optimizers_zero_grad()
+        trainer.global_step += 1
+
+
+def _fixed_input_forward_loss(model: Eagle3DraftModel) -> torch.Tensor:
+    """Return the real next-step model loss for fixed CPU input tensors."""
+    seq_len = 4
+    hidden_size = TINY_LLAMA_CONFIG.hidden_size
+    assert hidden_size is not None
+    model.eval()
+    with torch.no_grad():
+        _tokens, loss, _metrics = model(
+            hidden_states=torch.linspace(
+                -0.1,
+                0.1,
+                steps=seq_len * hidden_size * 3,
+            ).reshape(1, seq_len, hidden_size * 3),
+            input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+            document_ids=torch.zeros((1, seq_len), dtype=torch.long),
+            loss_mask=torch.ones((1, seq_len), dtype=torch.bool),
+            verifier_last_hidden_states=torch.linspace(
+                -0.05,
+                0.05,
+                steps=seq_len * hidden_size,
+            ).reshape(1, seq_len, hidden_size),
+            ttt_steps=1,
+        )
+    assert torch.isfinite(loss)
+    return loss
+
+
+def _assert_optimizer_state_equal(
+    expected: torch.optim.Optimizer,
+    actual: torch.optim.Optimizer,
+) -> None:
+    expected_state = expected.state_dict()
+    actual_state = actual.state_dict()
+    assert expected_state["param_groups"] == actual_state["param_groups"]
+    assert expected_state["state"].keys() == actual_state["state"].keys()
+    for parameter_id, expected_values in expected_state["state"].items():
+        actual_values = actual_state["state"][parameter_id]
+        assert expected_values.keys() == actual_values.keys()
+        for key, expected_value in expected_values.items():
+            actual_value = actual_values[key]
+            if isinstance(expected_value, torch.Tensor):
+                assert isinstance(actual_value, torch.Tensor)
+                assert expected_value.dtype == torch.float32
+                torch.testing.assert_close(
+                    actual_value,
+                    expected_value,
+                    rtol=1e-6,
+                    atol=1e-6,
+                )
+            else:
+                assert actual_value == expected_value
+
+
+def _worker_cpu_ddp_resume_loads_each_rank(
+    rank: int,
+    world_size: int,
+    checkpoint_dir: str,
+    save_init_file: str,
+    resume_init_file: str,
+) -> None:
+    """Save at step 4, then resume a fresh CPU model in a new group."""
+    _cpu_gloo_setup(rank, world_size, save_init_file)
+    try:
+        reference_sampler = _ResumeBatchSampler()
+        reference_model = _make_seeded_tiny_model(seed=17)
+        reference_trainer = _make_trainer_no_init(
+            reference_model,
+            local_rank="cpu",
+            save_path=f"{checkpoint_dir}-reference",
+        )
+        reference_trainer.train_loader = _ResumeLoader(reference_sampler)
+        reference_trainer.checkpointer = SingleGPUCheckpointer(
+            reference_trainer.config.save_path
+        )
+        reference_trainer.setup_trainer()
+        reference_trainer.setup_optimizer()
+        _run_synthetic_steps(reference_trainer, stop_global_step=8)
+        reference_parameter_sha256 = _parameter_sha256(reference_model)
+        reference_next_sample_ids = reference_sampler._generate_batches(0)[4]
+        reference_next_step_loss = _fixed_input_forward_loss(reference_model)
+
+        model = _make_seeded_tiny_model(seed=17)
+        interrupted_sampler = _ResumeBatchSampler()
+        interrupted_trainer = _make_trainer_no_init(
+            model,
+            is_distributed=True,
+            local_rank="cpu",
+            save_path=checkpoint_dir,
+        )
+        interrupted_trainer.train_loader = _ResumeLoader(interrupted_sampler)
+        interrupted_trainer.checkpointer = SingleGPUCheckpointer(checkpoint_dir)
+        interrupted_trainer.setup_trainer()
+        interrupted_trainer.setup_optimizer()
+        _run_synthetic_steps(interrupted_trainer, stop_global_step=4)
+        saved_parameter_sha256 = _parameter_sha256(model)
+
+        # All ranks enter the real Trainer checkpoint path. The resulting
+        # training_state.json carries epoch/local step/global step for resume.
+        interrupted_trainer.maybe_save_checkpoint(epoch=0, local_step=4)
+        # The regular Trainer path writes BF16 model tensors. Rewrite only this
+        # test fixture's model payload at FP32 so the required 1e-6 equivalence
+        # check measures resume behavior rather than intentional BF16 rounding;
+        # training_state.json and scheduler state remain from maybe_save_checkpoint.
+        interrupted_trainer.checkpointer.save_checkpoint(
+            model,
+            interrupted_trainer.optimizers,
+            epoch=0,
+            float_dtype=torch.float32,
+        )
+        dist.barrier()
+    finally:
+        _dist_teardown()
+
+    _cpu_gloo_setup(rank, world_size, resume_init_file)
+    original_ddp = trainer_module.DistributedDataParallel
+    original_device = checkpointer_module.get_current_device
+    try:
+        fresh_model = _make_seeded_tiny_model(seed=31 + rank)
+        _fill_trainable_parameters(fresh_model, 10.0 + rank)
+        resumed_sampler = _ResumeBatchSampler()
+        trainer = _make_trainer_no_init(
+            fresh_model,
+            is_distributed=True,
+            resume_from_checkpoint=True,
+            local_rank="cpu",
+            save_path=checkpoint_dir,
+            fsdp_shard=False,
+        )
+        trainer.train_loader = _ResumeLoader(resumed_sampler)
+        trainer.checkpointer = SingleGPUCheckpointer(checkpoint_dir)
+
+        # CPU/Gloo does not have an accelerator device. Keep the real
+        # Trainer resume branch and real checkpointer, while preventing DDP's
+        # constructor broadcast from masking a missing per-rank checkpoint load.
+        checkpointer_module.get_current_device = lambda: "cpu"
+        trainer_module.DistributedDataParallel = lambda model: model
+        trainer.setup_trainer()
+        assert trainer.current_epoch == 0
+        assert trainer._resume_local_step == 4
+        assert trainer.global_step == 4
+        trainer.setup_model()
+        trainer.setup_optimizer()
+
+        hashes = [None, None]
+        dist.all_gather_object(hashes, _parameter_sha256(fresh_model))
+        assert len(set(hashes)) == 1
+        assert hashes[0] == saved_parameter_sha256
+
+        assert trainer._prepare_resume_skip(trainer.current_epoch) == 4
+        resumed_next_sample_ids = next(iter(resumed_sampler))
+        assert resumed_next_sample_ids == reference_next_sample_ids
+
+        _run_synthetic_steps(trainer, stop_global_step=8)
+        resumed_next_step_loss = _fixed_input_forward_loss(fresh_model)
+
+        assert trainer.global_step == reference_trainer.global_step
+        assert resumed_next_sample_ids == reference_next_sample_ids
+        assert _parameter_sha256(fresh_model) == reference_parameter_sha256
+        _assert_optimizer_state_equal(
+            reference_trainer.optimizers[0], trainer.optimizers[0]
+        )
+        assert (
+            trainer.schedulers[0].state_dict()
+            == reference_trainer.schedulers[0].state_dict()
+        )
+        torch.testing.assert_close(
+            trainer.optimizers[0].param_groups[0]["lr"],
+            reference_trainer.optimizers[0].param_groups[0]["lr"],
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        relative_next_step_loss_error = (
+            resumed_next_step_loss - reference_next_step_loss
+        ).abs() / reference_next_step_loss.abs().clamp_min(1e-30)
+        assert relative_next_step_loss_error.item() <= 1e-6
+    finally:
+        trainer_module.DistributedDataParallel = original_ddp
+        checkpointer_module.get_current_device = original_device
+        _dist_teardown()
+
+
+def test_cpu_ddp_resume_loads_model_state_on_every_rank(tmp_path):
+    """A bounded DDP resume restores model, trainer state, sampler, and loss."""
+    world_size = 2
+    context = mp.start_processes(
+        _worker_cpu_ddp_resume_loads_each_rank,
+        args=(
+            world_size,
+            str(tmp_path / "checkpoint"),
+            str(tmp_path / "save-gloo-init"),
+            str(tmp_path / "resume-gloo-init"),
+        ),
+        nprocs=world_size,
+        join=False,
+        start_method="spawn",
+    )
+    deadline = time.monotonic() + 60
+    try:
+        while not context.join(timeout=1, grace_period=1):
+            if time.monotonic() >= deadline:
+                pytest.fail("CPU/Gloo DDP resume regression exceeded its 60s deadline")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
 
 
 def _worker_distributed_resume(rank, world_size, ckpt_dir, results_dir, fsdp_shard):
