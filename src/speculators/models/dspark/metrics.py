@@ -11,6 +11,7 @@ from functools import partial
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch.nn.functional import binary_cross_entropy_with_logits, softmax
 
 from speculators.models.metrics import (
@@ -41,6 +42,11 @@ def _masked_decayed_mean(
         weighted = weighted * decay_fn(
             pos_idx.to(weighted.dtype), elementwise_loss=elementwise
         )
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        global_denominator = loss_mask.sum().detach()
+        dist.all_reduce(global_denominator, op=dist.ReduceOp.SUM)
+        return weighted.sum() / (global_denominator + _EPS) * dist.get_world_size()
+
     denominator = loss_mask.sum(dim=1) + _EPS
     return (weighted.sum(dim=1) / denominator).mean()
 
