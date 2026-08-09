@@ -30,10 +30,11 @@ class TestTrainvLLM:
         np.save(d2t_path, d2t.cpu().numpy())
         np.save(t2d_path, t2d.cpu().numpy())
 
-    def _run_training(self, script_path: str, args_dict: dict):
+    def _run_training(self, args_dict: dict):
         cmd = [
             "python",
-            script_path,
+            "-m",
+            "speculators.train",
         ]
 
         for key, value in args_dict.items():
@@ -85,7 +86,7 @@ class TestTrainvLLM:
             "legacy-data": True,
         }
         # 3. Train draft model for one epoch
-        p = self._run_training("scripts/train.py", training_args)
+        p = self._run_training(training_args)
         p.wait()
 
         stdout, stderr = p.communicate()
