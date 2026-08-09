@@ -163,6 +163,7 @@ def _gradient_l2_norms(
     *,
     is_distributed_run: bool,
     fsdp_shard: bool,
+    process_group: dist.ProcessGroup | None = None,
 ) -> tuple[float, float]:
     first_parameter = next(model.parameters(), None)
     device = (
@@ -180,14 +181,24 @@ def _gradient_l2_norms(
         squared_norms[index] += grad.detach().double().square().sum()
 
     if is_distributed_run:
-        dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
+        dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM, group=process_group)
         if not fsdp_shard:
-            squared_norms /= dist.get_world_size()
+            squared_norms /= dist.get_world_size(group=process_group)
 
     if not bool(torch.isfinite(squared_norms).all().item()):
         raise ValueError("non-finite gradient norm observed after backward")
     ordinary, confidence = squared_norms.sqrt().tolist()
     return float(ordinary), float(confidence)
+
+
+def _training_process_group(model: torch.nn.Module) -> dist.ProcessGroup | None:
+    if isinstance(model, DistributedDataParallel):
+        return model.process_group
+    for parameter in model.parameters():
+        device_mesh = getattr(parameter, "device_mesh", None)
+        if device_mesh is not None:
+            return device_mesh.get_group()
+    return None
 
 
 def _resolve_scheduler_steps(
@@ -520,7 +531,17 @@ class Trainer:
         if self.observer is None:
             return
         loss_value = float(loss.detach().float().item())
-        if not math.isfinite(loss_value):
+        process_group = _training_process_group(self.model)
+        loss_is_finite = torch.tensor(
+            int(math.isfinite(loss_value)), dtype=torch.int32, device=loss.device
+        )
+        if self.is_distributed:
+            dist.all_reduce(
+                loss_is_finite,
+                op=dist.ReduceOp.MIN,
+                group=process_group,
+            )
+        if not bool(loss_is_finite.item()):
             raise ValueError("non-finite loss observed after backward")
         sampler = self.train_loader.batch_sampler
         if not hasattr(sampler, "remaining_batches"):
@@ -538,6 +559,7 @@ class Trainer:
             self.model,
             is_distributed_run=self.is_distributed,
             fsdp_shard=self.config.fsdp_shard,
+            process_group=process_group,
         )
         self.observer.after_backward(
             BackwardEvidence(
@@ -834,10 +856,10 @@ class Trainer:
             if self.is_distributed:
                 dist.barrier()
 
+            self.maybe_update_best(epoch, val_metrics)
+
             if self.checkpointer.complete_marker_path(epoch).is_file():
                 checkpoint_epoch = epoch
-
-            self.maybe_update_best(epoch, val_metrics)
 
             if self.is_distributed:
                 dist.barrier()

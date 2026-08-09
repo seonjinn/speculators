@@ -16,6 +16,7 @@ import hashlib
 import os
 import tempfile
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,6 +28,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
 )
+from torch.distributed.device_mesh import DeviceMesh
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from speculators import SpeculatorsConfig, VerifierConfig
@@ -713,6 +715,27 @@ class _GradientEvidenceProbe(torch.nn.Module):
         self.confidence_head.weight.grad = torch.tensor([[4.0]])
 
 
+class _FSDP2GradientEvidenceProbe(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [torch.nn.Linear(1, 1, bias=False)]
+        )
+        self.confidence_head = torch.nn.Linear(1, 1, bias=False)
+        self.unused = torch.nn.Parameter(torch.tensor([1.0]))
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return (
+            3.0 * self.layers[0](values).sum()
+            + 4.0 * self.confidence_head(values).sum()
+        )
+
+
+class _NoOpTrainingObserver:
+    def after_backward(self, _evidence: object) -> None:
+        pass
+
+
 class _ResumeLoader:
     def __init__(self, sampler: _ResumeBatchSampler) -> None:
         self.batch_sampler = sampler
@@ -786,6 +809,161 @@ def _assert_optimizer_state_equal(
                 )
             else:
                 assert actual_value == expected_value
+
+
+def _worker_cpu_ddp_synchronizes_nonfinite_loss(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    results_dir: str,
+) -> None:
+    _cpu_gloo_setup(rank, world_size, init_file)
+    try:
+        probe = _GradientEvidenceProbe()
+        model = torch.nn.parallel.DistributedDataParallel(probe)
+        probe.set_gradients()
+        trainer = Trainer.__new__(Trainer)
+        trainer.model = model
+        trainer.config = TrainerConfig(
+            lr=1e-4,
+            num_epochs=1,
+            save_path=results_dir,
+            fsdp_shard=False,
+        )
+        trainer.train_loader = _ResumeLoader(_ResumeBatchSampler())
+        trainer.is_distributed = True
+        trainer.observer = _NoOpTrainingObserver()
+        trainer.global_step = 0
+        loss = torch.tensor(float("nan") if rank == 0 else 1.0)
+
+        try:
+            trainer._notify_after_backward(epoch=0, local_step=1, loss=loss)
+        except Exception as error:  # noqa: BLE001 - cross-rank evidence is asserted
+            outcome = f"{type(error).__name__}: {error}"
+        else:
+            outcome = "no error"
+        (Path(results_dir) / f"nonfinite-rank-{rank}.txt").write_text(outcome)
+    finally:
+        _dist_teardown()
+
+
+def test_cpu_ddp_nonfinite_loss_fails_all_ranks_without_hanging(tmp_path: Path) -> None:
+    """A single-rank NaN is synchronized before gradient norm collectives."""
+    world_size = 2
+    context = mp.start_processes(
+        _worker_cpu_ddp_synchronizes_nonfinite_loss,
+        args=(world_size, str(tmp_path / "nonfinite-init"), str(tmp_path)),
+        nprocs=world_size,
+        join=False,
+        start_method="spawn",
+    )
+    deadline = time.monotonic() + 20
+    try:
+        while not context.join(timeout=1, grace_period=1):
+            if time.monotonic() >= deadline:
+                pytest.fail("non-finite loss synchronization exceeded 20 seconds")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
+    expected = "ValueError: non-finite loss observed after backward"
+    assert [
+        (tmp_path / f"nonfinite-rank-{rank}.txt").read_text()
+        for rank in range(world_size)
+    ] == [expected, expected]
+
+
+def _worker_cpu_fsdp2_gradient_norms(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    results_dir: str,
+) -> None:
+    _cpu_gloo_setup(rank, world_size, init_file)
+    try:
+        mesh = DeviceMesh("cpu", torch.arange(world_size))
+        model = _FSDP2GradientEvidenceProbe()
+        mp_policy = distributed_module.MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+        )
+        distributed_module.fully_shard(
+            model.layers[0], mesh=mesh, mp_policy=mp_policy
+        )
+        distributed_module.fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+        model(torch.ones(1, 1)).backward()
+        parameters = dict(model.named_parameters())
+        ordinary_grad = parameters["layers.0.weight"].grad
+        confidence_grad = parameters["confidence_head.weight"].grad
+        assert ordinary_grad is not None
+        assert confidence_grad is not None
+        assert hasattr(ordinary_grad, "to_local")
+        assert hasattr(confidence_grad, "to_local")
+        process_group = trainer_module._training_process_group(model)
+        assert process_group is not None
+        assert dist.get_world_size(group=process_group) == world_size
+        ordinary_grad_l2, confidence_grad_l2 = trainer_module._gradient_l2_norms(
+            model,
+            is_distributed_run=True,
+            fsdp_shard=True,
+            process_group=process_group,
+        )
+        torch.save(
+            {
+                "ordinary_grad_l2": ordinary_grad_l2,
+                "confidence_grad_l2": confidence_grad_l2,
+                "ordinary_local_numel": ordinary_grad.to_local().numel(),
+                "confidence_local_numel": confidence_grad.to_local().numel(),
+                "unused_grad_is_none": parameters["unused"].grad is None,
+            },
+            Path(results_dir) / f"fsdp2-rank-{rank}.pt",
+        )
+    finally:
+        _dist_teardown()
+
+
+@pytest.mark.skipif(
+    not hasattr(distributed_module, "fully_shard"),
+    reason="PyTorch build does not provide composable FSDP2 fully_shard",
+)
+def test_cpu_fsdp2_dtensor_gradient_norms_are_global_without_inflation(
+    tmp_path: Path,
+) -> None:
+    """Real FSDP2 shards count each gradient once, including empty/None shards."""
+    world_size = 2
+    context = mp.start_processes(
+        _worker_cpu_fsdp2_gradient_norms,
+        args=(world_size, str(tmp_path / "fsdp2-init"), str(tmp_path)),
+        nprocs=world_size,
+        join=False,
+        start_method="spawn",
+    )
+    deadline = time.monotonic() + 30
+    try:
+        while not context.join(timeout=1, grace_period=1):
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    "CPU/Gloo FSDP2 gradient norm regression exceeded 30 seconds"
+                )
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
+    results = [
+        torch.load(tmp_path / f"fsdp2-rank-{rank}.pt", weights_only=True)
+        for rank in range(world_size)
+    ]
+    for result in results:
+        assert result["ordinary_grad_l2"] == pytest.approx(3.0)
+        assert result["confidence_grad_l2"] == pytest.approx(4.0)
+        assert result["unused_grad_is_none"]
+    assert [result["ordinary_local_numel"] for result in results] == [1, 0]
+    assert [result["confidence_local_numel"] for result in results] == [1, 0]
 
 
 def _worker_cpu_ddp_resume_loads_each_rank(

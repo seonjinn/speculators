@@ -9,7 +9,12 @@ from torch.utils.data import DataLoader
 
 from speculators.model import SpeculatorModel
 from speculators.train.checkpointer import SingleGPUCheckpointer
-from speculators.train.trainer import TrainEpochResult, Trainer, TrainerConfig
+from speculators.train.trainer import (
+    TrainEpochResult,
+    Trainer,
+    TrainerConfig,
+    TrainingRunResult,
+)
 
 
 def _make_minimal_trainer(tmp_path: Path, checkpoint_freq: int, save_best: bool):
@@ -305,6 +310,34 @@ def test_save_best_flag_changes_checkpoint_behavior(
     assert best_path.exists()
     assert best_path.is_symlink()
     assert best_path.resolve() == (case_dir / expected_best_target).resolve()
+
+
+def test_run_training_returns_checkpoint_published_by_save_best(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The result includes a completed-epoch checkpoint created during best-save."""
+    trainer = _make_minimal_trainer(tmp_path, checkpoint_freq=99, save_best=True)
+    trainer.config = trainer.config._replace(num_epochs=1)
+    trainer.train_epoch = lambda _epoch: TrainEpochResult(
+        completed_epoch=True, local_step=1
+    )
+    trainer.val_epoch = lambda _epoch: {"loss_epoch": 0.25}
+
+    def fake_save_checkpoint(_model, _optimizers, epoch: int) -> None:
+        (tmp_path / str(epoch)).mkdir(exist_ok=True)
+
+    monkeypatch.setattr(
+        trainer.checkpointer, "save_checkpoint", fake_save_checkpoint
+    )
+
+    result = trainer.run_training()
+
+    assert result == TrainingRunResult(
+        checkpoint_epoch=0,
+        local_step=0,
+        global_step=0,
+    )
+    assert trainer.checkpointer.complete_marker_path(0).is_file()
 
 
 def test_checkpoint_freq_flag_controls_saves(
