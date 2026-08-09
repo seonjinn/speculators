@@ -1,9 +1,12 @@
 import json
 import logging
+import math
 import time
 import warnings
+from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, Protocol
 
 import torch
 import torch.distributed as dist
@@ -125,6 +128,68 @@ class TrainerConfig(NamedTuple):
     max_steps: int | None = None
 
 
+@dataclass(frozen=True)
+class TrainEpochResult:
+    completed_epoch: bool
+    local_step: int
+
+
+@dataclass(frozen=True)
+class BackwardEvidence:
+    epoch: int
+    local_step: int
+    global_step: int
+    sample_indices: tuple[int, ...]
+    loss: float
+    ordinary_grad_l2: float
+    confidence_grad_l2: float
+
+
+class TrainingObserver(Protocol):
+    def after_backward(self, evidence: BackwardEvidence) -> None:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class TrainingRunResult:
+    checkpoint_epoch: int | None
+    local_step: int
+    global_step: int
+
+
+@torch.no_grad()
+def _gradient_l2_norms(
+    model: torch.nn.Module,
+    *,
+    is_distributed_run: bool,
+    fsdp_shard: bool,
+) -> tuple[float, float]:
+    first_parameter = next(model.parameters(), None)
+    device = (
+        first_parameter.device if first_parameter is not None else torch.device("cpu")
+    )
+    squared_norms = torch.zeros(2, dtype=torch.float64, device=device)
+
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad or parameter.grad is None:
+            continue
+        grad = parameter.grad
+        if hasattr(grad, "to_local"):
+            grad = grad.to_local()
+        index = 1 if "confidence_head" in name.split(".") else 0
+        squared_norms[index] += grad.detach().double().square().sum()
+
+    if is_distributed_run:
+        dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
+        if not fsdp_shard:
+            squared_norms /= dist.get_world_size()
+
+    if not bool(torch.isfinite(squared_norms).all().item()):
+        raise ValueError("non-finite gradient norm observed after backward")
+    ordinary, confidence = squared_norms.sqrt().tolist()
+    return float(ordinary), float(confidence)
+
+
 def _resolve_scheduler_steps(
     config: TrainerConfig,
     train_loader_len: int,
@@ -170,6 +235,7 @@ class Trainer:
         config: TrainerConfig,
         train_loader: DataLoader,
         val_loader: DataLoader | None = None,
+        observer: TrainingObserver | None = None,
     ):
         self.model = model
         self.config = config
@@ -177,6 +243,7 @@ class Trainer:
         self.rank = get_rank()
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.observer = observer
         self.is_distributed = is_distributed()
         self.resume_from_checkpoint = config.resume_from_checkpoint
         acc = torch.accelerator.current_accelerator()
@@ -427,25 +494,14 @@ class Trainer:
         skip_steps = 0
         if epoch == getattr(self, "current_epoch", epoch):
             skip_steps = getattr(self, "_resume_local_step", 0)
-            # Only skip once — clear after use.
-            self._resume_local_step = 0
 
-        # Fast-skip: slice the sampler's pre-generated batch list so we never
-        # call __getitem__ (and thus never call vLLM) for skipped batches.
         sampler = self.train_loader.batch_sampler
-        has_fast_skip_api = hasattr(sampler, "_generate_batches") and hasattr(
-            sampler, "_cached_generated_batches"
-        )
-        if skip_steps > 0 and has_fast_skip_api:
-            all_batches = sampler._generate_batches(epoch)  # type: ignore[union-attr]  # noqa: SLF001
-            remaining = all_batches[skip_steps:]
-            # Temporarily override the sampler cache with the sliced list.
-            sampler._cached_generated_batches = (  # type: ignore[union-attr]  # noqa: SLF001
-                epoch,
-                remaining,
+        if skip_steps > 0 and hasattr(sampler, "resume_from_batch"):
+            sampler.resume_from_batch(  # type: ignore[union-attr]
+                epoch=epoch, completed_batches=skip_steps
             )
             root_logger.info(
-                f"Fast-skipping {skip_steps} batches via sampler slice "
+                f"Fast-skipping {skip_steps} batches via sampler resume "
                 f"(no vLLM calls for skipped batches). "
                 f"epoch={epoch}, global_step={self.global_step}."
             )
@@ -454,9 +510,48 @@ class Trainer:
                 "Sampler lacks fast-skip API; resume will replay "
                 f"{skip_steps} batches from the start of the epoch."
             )
+        if skip_steps > 0:
+            self._resume_local_step = 0
         return skip_steps
 
-    def train_epoch(self, epoch: int):
+    def _notify_after_backward(
+        self, *, epoch: int, local_step: int, loss: torch.Tensor
+    ) -> None:
+        if self.observer is None:
+            return
+        loss_value = float(loss.detach().float().item())
+        if not math.isfinite(loss_value):
+            raise ValueError("non-finite loss observed after backward")
+        sampler = self.train_loader.batch_sampler
+        if not hasattr(sampler, "remaining_batches"):
+            raise TypeError(
+                "training observer requires a batch sampler with remaining_batches()"
+            )
+        remaining = sampler.remaining_batches(  # type: ignore[union-attr]
+            epoch=epoch, completed_batches=local_step - 1
+        )
+        if not remaining:
+            raise RuntimeError(
+                "training observer could not resolve the current sampler batch"
+            )
+        ordinary_grad_l2, confidence_grad_l2 = _gradient_l2_norms(
+            self.model,
+            is_distributed_run=self.is_distributed,
+            fsdp_shard=self.config.fsdp_shard,
+        )
+        self.observer.after_backward(
+            BackwardEvidence(
+                epoch=epoch,
+                local_step=local_step,
+                global_step=self.global_step + 1,
+                sample_indices=tuple(int(index) for index in remaining[0]),
+                loss=loss_value,
+                ordinary_grad_l2=ordinary_grad_l2,
+                confidence_grad_l2=confidence_grad_l2,
+            )
+        )
+
+    def train_epoch(self, epoch: int) -> TrainEpochResult:  # noqa: C901
         self.model.train()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
             self.train_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
@@ -466,8 +561,17 @@ class Trainer:
 
         # Determine how many batches to skip for mid-epoch resume.
         skip_steps = self._prepare_resume_skip(epoch)
+        if (
+            self.config.max_steps is not None
+            and self.global_step >= self.config.max_steps
+        ):
+            return TrainEpochResult(completed_epoch=False, local_step=skip_steps)
 
         train_loader = self.train_loader
+        if skip_steps > 0 and not hasattr(
+            self.train_loader.batch_sampler, "resume_from_batch"
+        ):
+            train_loader = islice(train_loader, skip_steps, None)  # type: ignore[assignment]
         if self.rank == 0:
             train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
@@ -503,6 +607,7 @@ class Trainer:
             self._optimizers_zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self._notify_after_backward(epoch=epoch, local_step=local_step, loss=loss)
 
             timer.mark("bwd")
             self._optimizers_step()
@@ -546,7 +651,10 @@ class Trainer:
                 self.config.max_steps is not None
                 and self.global_step >= self.config.max_steps
             ):
-                break
+                return TrainEpochResult(
+                    completed_epoch=local_step == num_steps,
+                    local_step=local_step,
+                )
 
             if (
                 step_interval is not None
@@ -556,6 +664,8 @@ class Trainer:
                 # Avoid saving back to back ay the end of each epoch
             ):
                 self.maybe_save_checkpoint(epoch, local_step=local_step)
+
+        return TrainEpochResult(completed_epoch=True, local_step=num_steps)
 
     def _maybe_val_sync(self, batch_index: int) -> None:
         if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:
@@ -614,14 +724,20 @@ class Trainer:
 
         return val_metrics
 
-    def maybe_save_checkpoint(self, epoch: int | str, local_step: int = 0):
-        if epoch != "interrupted" and (
-            self.config.save_best
-            or (
-                self.config.checkpoint_freq >= 1
-                and isinstance(epoch, int)
-                and epoch != 0
-                and (epoch + 1) % self.config.checkpoint_freq != 0
+    def maybe_save_checkpoint(
+        self, epoch: int | str, local_step: int = 0, *, force: bool = False
+    ):
+        if (
+            not force
+            and epoch != "interrupted"
+            and (
+                self.config.save_best
+                or (
+                    self.config.checkpoint_freq >= 1
+                    and isinstance(epoch, int)
+                    and epoch != 0
+                    and (epoch + 1) % self.config.checkpoint_freq != 0
+                )
             )
         ):
             return
@@ -679,11 +795,23 @@ class Trainer:
             self.checkpointer.cleanup_keep_only_best(best_epoch=epoch)
 
     @with_graceful_shutdown()
-    def run_training(self):
+    def run_training(self) -> TrainingRunResult:  # noqa: C901
         n_epochs = self.config.num_epochs
+        checkpoint_epoch: int | None = None
         for epoch in range(self.current_epoch, n_epochs):
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
-            self.train_epoch(epoch)
+            epoch_result = self.train_epoch(epoch)
+            if not epoch_result.completed_epoch:
+                self.maybe_save_checkpoint(
+                    epoch, local_step=epoch_result.local_step, force=True
+                )
+                if self.is_distributed:
+                    dist.barrier()
+                return TrainingRunResult(
+                    checkpoint_epoch=epoch,
+                    local_step=epoch_result.local_step,
+                    global_step=self.global_step,
+                )
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
 
             if self.is_distributed:
@@ -706,7 +834,22 @@ class Trainer:
             if self.is_distributed:
                 dist.barrier()
 
+            if self.checkpointer.complete_marker_path(epoch).is_file():
+                checkpoint_epoch = epoch
+
             self.maybe_update_best(epoch, val_metrics)
 
             if self.is_distributed:
                 dist.barrier()
+
+            if (
+                self.config.max_steps is not None
+                and self.global_step >= self.config.max_steps
+            ):
+                break
+
+        return TrainingRunResult(
+            checkpoint_epoch=checkpoint_epoch,
+            local_step=0,
+            global_step=self.global_step,
+        )

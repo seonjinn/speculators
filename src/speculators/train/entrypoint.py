@@ -34,7 +34,12 @@ from speculators.train.distributed import (
     maybe_setup_distributed,
 )
 from speculators.train.logger import setup_metric_logger, setup_root_logger
-from speculators.train.trainer import Trainer, TrainerConfig
+from speculators.train.trainer import (
+    Trainer,
+    TrainerConfig,
+    TrainingObserver,
+    TrainingRunResult,
+)
 from speculators.train.utils import resolve_mask_token_id
 from speculators.train.vocab_mapping import (
     build_vocab_mappings_from_distribution,
@@ -520,11 +525,21 @@ class _TrainingSession:
     trainer: Trainer | None
     draft_model: SpeculatorModel | None
 
-    def run(self) -> None:
+    def run(self) -> TrainingRunResult:
         if self.trainer is None or self.draft_model is None:
-            return
+            return TrainingRunResult(
+                checkpoint_epoch=None,
+                local_step=0,
+                global_step=0,
+            )
 
-        self.trainer.run_training()
+        result = self.trainer.run_training()
+        if result is None:
+            result = TrainingRunResult(
+                checkpoint_epoch=None,
+                local_step=0,
+                global_step=self.trainer.global_step,
+            )
 
         self.trainer = None
         self.draft_model = None
@@ -532,9 +547,14 @@ class _TrainingSession:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         maybe_destroy_distributed()
+        return result
 
 
-def _build_training_session(cfg: TrainConfig) -> _TrainingSession:  # noqa: C901
+def _build_training_session(  # noqa: C901
+    cfg: TrainConfig,
+    *,
+    observer: TrainingObserver | None = None,
+) -> _TrainingSession:
     # Phase-1 adapter: the model layer still consumes a flat vars(args)-shaped
     # dict via **kwargs, so flatten the typed config back into a namespace here.
     # New code should read cfg.<group>.<field> directly and must NOT add new
@@ -704,13 +724,27 @@ def _build_training_session(cfg: TrainConfig) -> _TrainingSession:  # noqa: C901
         fsdp_shard=args.fsdp_shard,
         max_steps=args.max_steps,
     )
-    trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
+    trainer = Trainer(
+        draft_model,
+        trainer_config,
+        train_loader,
+        val_loader,
+        observer=observer,
+    )
     return _TrainingSession(trainer=trainer, draft_model=draft_model)
 
 
-def run_training(cfg: TrainConfig) -> None:
-    session = _build_training_session(cfg)
-    session.run()
+def run_training(
+    cfg: TrainConfig,
+    *,
+    observer: TrainingObserver | None = None,
+) -> TrainingRunResult:
+    session = (
+        _build_training_session(cfg)
+        if observer is None
+        else _build_training_session(cfg, observer=observer)
+    )
+    return session.run()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

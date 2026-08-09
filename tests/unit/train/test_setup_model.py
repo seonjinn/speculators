@@ -672,21 +672,45 @@ class _ResumeBatchSampler:
     def __init__(self) -> None:
         self.all_batches = [[101], [103], [107], [109], [113], [127], [131], [137]]
         self.epoch = 0
-        self._cached_generated_batches: tuple[int, list[list[int]]] = (-1, [])
+        self._resume_once: tuple[int, int] | None = None
 
     def __iter__(self):
-        yield from self._generate_batches(self.epoch)
+        if self._resume_once is not None and self._resume_once[0] == self.epoch:
+            epoch, completed_batches = self._resume_once
+            self._resume_once = None
+            yield from self.remaining_batches(
+                epoch=epoch, completed_batches=completed_batches
+            )
+            return
+        yield from self.all_batches
 
     def __len__(self) -> int:
-        return len(self._generate_batches(self.epoch))
+        return len(self.all_batches)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
 
-    def _generate_batches(self, epoch: int) -> list[list[int]]:
-        if self._cached_generated_batches[0] != epoch:
-            self._cached_generated_batches = (epoch, list(self.all_batches))
-        return self._cached_generated_batches[1]
+    def remaining_batches(
+        self, *, epoch: int, completed_batches: int
+    ) -> tuple[list[int], ...]:
+        if completed_batches < 0 or completed_batches > len(self.all_batches):
+            raise ValueError("invalid completed_batches")
+        return tuple(list(batch) for batch in self.all_batches[completed_batches:])
+
+    def resume_from_batch(self, *, epoch: int, completed_batches: int) -> None:
+        self.remaining_batches(epoch=epoch, completed_batches=completed_batches)
+        self._resume_once = (epoch, completed_batches)
+
+
+class _GradientEvidenceProbe(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ordinary = torch.nn.Parameter(torch.tensor([0.0]))
+        self.confidence_head = torch.nn.Linear(1, 1, bias=False)
+
+    def set_gradients(self) -> None:
+        self.ordinary.grad = torch.tensor([3.0])
+        self.confidence_head.weight.grad = torch.tensor([[4.0]])
 
 
 class _ResumeLoader:
@@ -789,8 +813,20 @@ def _worker_cpu_ddp_resume_loads_each_rank(
         reference_trainer.setup_optimizer()
         _run_synthetic_steps(reference_trainer, stop_global_step=8)
         reference_parameter_sha256 = _parameter_sha256(reference_model)
-        reference_next_sample_ids = reference_sampler._generate_batches(0)[4]
+        reference_next_sample_ids = reference_sampler.remaining_batches(
+            epoch=0, completed_batches=4
+        )[0]
         reference_next_step_loss = _fixed_input_forward_loss(reference_model)
+
+        gradient_probe = _GradientEvidenceProbe()
+        gradient_probe.set_gradients()
+        ordinary_grad_l2, confidence_grad_l2 = trainer_module._gradient_l2_norms(
+            gradient_probe,
+            is_distributed_run=True,
+            fsdp_shard=False,
+        )
+        assert ordinary_grad_l2 == pytest.approx(3.0)
+        assert confidence_grad_l2 == pytest.approx(4.0)
 
         model = _make_seeded_tiny_model(seed=17)
         interrupted_sampler = _ResumeBatchSampler()

@@ -273,9 +273,16 @@ class MultipackDistributedBatchSamplerV2(Sampler):
             if self.rank == 0:
                 warnings.warn(msg, stacklevel=1)
 
-        self._cached_generated_batches = (-1, [])
+        self._cached_generated_batches: tuple[int, list[NDArray]] = (-1, [])
+        self._resume_once: tuple[int, int] | None = None
 
     def __iter__(self):
+        if self._resume_once is not None and self._resume_once[0] == self.epoch:
+            epoch, completed_batches = self._resume_once
+            self._resume_once = None
+            return iter(
+                self.remaining_batches(epoch=epoch, completed_batches=completed_batches)
+            )
         batches = self._generate_batches(self.epoch)
         return iter(batches)
 
@@ -285,6 +292,21 @@ class MultipackDistributedBatchSamplerV2(Sampler):
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+
+    def remaining_batches(
+        self, *, epoch: int, completed_batches: int
+    ) -> tuple[NDArray, ...]:
+        batches = self._generate_batches(epoch)
+        if completed_batches < 0 or completed_batches > len(batches):
+            raise ValueError(
+                "completed_batches must be between 0 and the number of epoch "
+                f"batches ({len(batches)}), got {completed_batches}"
+            )
+        return tuple(batch.copy() for batch in batches[completed_batches:])
+
+    def resume_from_batch(self, *, epoch: int, completed_batches: int) -> None:
+        self.remaining_batches(epoch=epoch, completed_batches=completed_batches)
+        self._resume_once = (epoch, completed_batches)
 
     def _generate_batches(self, epoch: int) -> list[NDArray]:
         """Generate batches for this rank

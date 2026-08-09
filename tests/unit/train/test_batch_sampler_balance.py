@@ -145,3 +145,85 @@ def test_unrepresentable_final_tail_fails_instead_of_dropping_samples():
 
     with pytest.raises(ValueError, match="cannot rebalance final sampler tail"):
         list(iter(sampler))
+
+
+def _small_sampler() -> MultipackDistributedBatchSamplerV2:
+    return MultipackDistributedBatchSamplerV2(
+        batch_max_length=3,
+        lengths=np.ones(18, dtype=np.int64),
+        num_replicas=1,
+        rank=0,
+        seed=17,
+    )
+
+
+def _assert_batches_equal(
+    actual: tuple[np.ndarray, ...] | list[np.ndarray],
+    expected: tuple[np.ndarray, ...] | list[np.ndarray],
+) -> None:
+    assert len(actual) == len(expected)
+    for actual_batch, expected_batch in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(actual_batch, expected_batch)
+
+
+def test_remaining_batches_returns_exact_defensive_copies_without_cache_mutation():
+    """A suffix mutation must not alter the deterministic full epoch."""
+    sampler = _small_sampler()
+    full_epoch = tuple(batch.copy() for batch in sampler)
+
+    suffix = sampler.remaining_batches(epoch=0, completed_batches=2)
+    _assert_batches_equal(suffix, full_epoch[2:])
+    assert all(
+        actual is not cached
+        for actual, cached in zip(suffix, full_epoch[2:], strict=True)
+    )
+
+    suffix[0][0] = -1
+
+    _assert_batches_equal(
+        sampler.remaining_batches(epoch=0, completed_batches=2), full_epoch[2:]
+    )
+    _assert_batches_equal(list(sampler), full_epoch)
+    assert len(sampler) == len(full_epoch)
+
+
+def test_remaining_batches_is_repeatable_after_generating_another_epoch():
+    """Evicting the one-epoch cache must not change an earlier epoch's suffix."""
+    sampler = _small_sampler()
+    first = sampler.remaining_batches(epoch=3, completed_batches=1)
+
+    sampler.remaining_batches(epoch=4, completed_batches=0)
+
+    second = sampler.remaining_batches(epoch=3, completed_batches=1)
+    _assert_batches_equal(second, first)
+
+
+@pytest.mark.parametrize("completed_batches", [-1, 7])
+def test_remaining_batches_rejects_invalid_offsets(completed_batches: int):
+    """Offsets outside the closed full-epoch boundary are invalid."""
+    sampler = _small_sampler()
+
+    with pytest.raises(ValueError, match="completed_batches"):
+        sampler.remaining_batches(epoch=0, completed_batches=completed_batches)
+
+
+def test_remaining_batches_accepts_the_exact_epoch_length():
+    """A checkpoint after the final batch has an empty valid suffix."""
+    sampler = _small_sampler()
+
+    assert sampler.remaining_batches(epoch=0, completed_batches=len(sampler)) == ()
+
+
+def test_resume_from_batch_is_one_shot_and_preserves_full_epoch_cache():
+    """Only the next matching iterator consumes the suffix request."""
+    sampler = _small_sampler()
+    full_epoch = tuple(batch.copy() for batch in sampler)
+
+    sampler.resume_from_batch(epoch=0, completed_batches=2)
+
+    _assert_batches_equal(list(sampler), full_epoch[2:])
+    _assert_batches_equal(list(sampler), full_epoch)
+    _assert_batches_equal(
+        sampler.remaining_batches(epoch=0, completed_batches=0), full_epoch
+    )
+    assert len(sampler) == len(full_epoch)

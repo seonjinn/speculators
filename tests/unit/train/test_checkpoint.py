@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from speculators.model import SpeculatorModel
 from speculators.train.checkpointer import SingleGPUCheckpointer
-from speculators.train.trainer import Trainer, TrainerConfig
+from speculators.train.trainer import TrainEpochResult, Trainer, TrainerConfig
 
 
 def _make_minimal_trainer(tmp_path: Path, checkpoint_freq: int, save_best: bool):
@@ -211,7 +211,7 @@ def test_run_training_updates_checkpoint_best_among_saved_checkpoints_save_best_
     }
 
     def fake_train_epoch(epoch: int):
-        return None
+        return TrainEpochResult(completed_epoch=True, local_step=0)
 
     def fake_val_epoch(epoch: int):
         return {"loss_epoch": val_losses[epoch]}
@@ -274,7 +274,9 @@ def test_save_best_flag_changes_checkpoint_behavior(
     saved_epochs: list[int] = []
     val_losses = {0: 0.9, 1: 0.8, 2: 0.85, 3: 0.7}
 
-    trainer.train_epoch = lambda _epoch: None
+    trainer.train_epoch = lambda _epoch: TrainEpochResult(
+        completed_epoch=True, local_step=0
+    )
     trainer.val_epoch = lambda epoch: {"loss_epoch": val_losses[epoch]}
 
     def fake_cp_save_checkpoint(_model, _opt, epoch: int):
@@ -314,7 +316,9 @@ def test_checkpoint_freq_flag_controls_saves(
     saved_epochs: list[int] = []
     val_losses = {0: 0.9, 1: 0.1, 2: 0.8, 3: 0.2, 4: 0.7, 5: 0.6, 6: 0.3}
 
-    trainer.train_epoch = lambda _epoch: None
+    trainer.train_epoch = lambda _epoch: TrainEpochResult(
+        completed_epoch=True, local_step=0
+    )
     trainer.val_epoch = lambda epoch: {"loss_epoch": val_losses[epoch]}
 
     def fake_cp_save_checkpoint(_model, _opt, epoch: int):
@@ -480,6 +484,7 @@ def test_graceful_shutdown_saves_interrupted_checkpoint(
     def fake_train_epoch(epoch: int):
         if epoch == 2:
             os.kill(os.getpid(), signal.SIGINT)
+        return TrainEpochResult(completed_epoch=True, local_step=0)
 
     def fake_val_epoch(epoch: int):
         return {"loss_epoch": 0.5}
@@ -541,6 +546,7 @@ def test_optimizer_state_round_trips_at_full_precision(tmp_path):
 
     checkpointer = SingleGPUCheckpointer(tmp_path)
     checkpointer.save_checkpoint(model, optimizer, epoch=0)
+    _mark_complete(tmp_path, 0)
 
     saved = torch.load(
         checkpointer.optimizer_path(0), weights_only=True, map_location="cpu"
@@ -579,6 +585,7 @@ def test_legacy_bf16_optimizer_step_is_restored_to_float32(tmp_path):
 
     checkpointer = SingleGPUCheckpointer(tmp_path)
     checkpointer.save_checkpoint(model, optimizer, epoch=0)
+    _mark_complete(tmp_path, 0)
 
     # Rewrite the saved file the way the old bf16-casting save path would have.
     legacy = torch.load(

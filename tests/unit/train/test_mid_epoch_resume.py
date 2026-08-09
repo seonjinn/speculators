@@ -5,15 +5,21 @@ import tempfile
 from pathlib import Path
 from typing import Protocol, cast
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from speculators.model import SpeculatorModel
+from speculators.train import entrypoint as entrypoint_module
+from speculators.train import trainer as trainer_module
 from speculators.train.checkpointer import (
     DistributedCheckpointer,
     SingleGPUCheckpointer,
+)
+from speculators.train.distributed_batch_sampler import (
+    MultipackDistributedBatchSamplerV2,
 )
 from speculators.train.trainer import Trainer, TrainerConfig
 
@@ -61,12 +67,6 @@ def _make_loader() -> DataLoader:
 
 class _BatchSamplerWithSetEpoch(Protocol):
     def set_epoch(self, epoch: int) -> None: ...
-
-
-class _FastSkipBatchSamplerProtocol(Protocol):
-    _cached_generated_batches: tuple[int, list[list[int]]] | None
-
-    def _generate_batches(self, epoch: int) -> list[list[int]]: ...
 
 
 def _dummy_model() -> SpeculatorModel:
@@ -322,30 +322,37 @@ class _CountingDataset(Dataset):
 class _FastSkipBatchSampler:
     def __init__(self, n_items: int):
         self.all_batches = [[i] for i in range(n_items)]
-        self._cached_generated_batches: tuple[int, list[list[int]]] | None = None
+        self._resume_once: tuple[int, int] | None = None
         self.generated_for_epoch: int | None = None
         self.current_epoch = 0
 
     def __len__(self) -> int:
-        if self._cached_generated_batches is not None:
-            return len(self._cached_generated_batches[1])
         return len(self.all_batches)
 
     def set_epoch(self, epoch: int) -> None:
         self.current_epoch = epoch
 
-    def _generate_batches(self, epoch: int) -> list[list[int]]:
+    def remaining_batches(
+        self, *, epoch: int, completed_batches: int
+    ) -> tuple[list[int], ...]:
         self.generated_for_epoch = epoch
-        return list(self.all_batches)
+        if completed_batches < 0 or completed_batches > len(self.all_batches):
+            raise ValueError("invalid completed_batches")
+        return tuple(list(batch) for batch in self.all_batches[completed_batches:])
+
+    def resume_from_batch(self, *, epoch: int, completed_batches: int) -> None:
+        self.remaining_batches(epoch=epoch, completed_batches=completed_batches)
+        self._resume_once = (epoch, completed_batches)
 
     def __iter__(self):
-        if (
-            self._cached_generated_batches is not None
-            and self._cached_generated_batches[0] == self.current_epoch
-        ):
-            yield from self._cached_generated_batches[1]
+        if self._resume_once is not None and self._resume_once[0] == self.current_epoch:
+            epoch, completed_batches = self._resume_once
+            self._resume_once = None
+            yield from self.remaining_batches(
+                epoch=epoch, completed_batches=completed_batches
+            )
             return
-        yield from self._generate_batches(self.current_epoch)
+        yield from self.remaining_batches(epoch=self.current_epoch, completed_batches=0)
 
 
 class _FastSkipMockTrainer(_MockTrainer):
@@ -356,20 +363,7 @@ class _FastSkipMockTrainer(_MockTrainer):
             )
             batch_sampler.set_epoch(epoch)
 
-        skip_steps = 0
-        if epoch == getattr(self, "current_epoch", epoch):
-            skip_steps = getattr(self, "_resume_local_step", 0)
-            self._resume_local_step = 0
-
-        sampler = self.train_loader.batch_sampler
-        has_fast_skip_api = hasattr(sampler, "_generate_batches") and hasattr(
-            sampler, "_cached_generated_batches"
-        )
-        if skip_steps > 0 and has_fast_skip_api:
-            fast_skip_sampler = cast("_FastSkipBatchSamplerProtocol", sampler)
-            all_batches = fast_skip_sampler._generate_batches(epoch)
-            remaining = all_batches[skip_steps:]
-            fast_skip_sampler._cached_generated_batches = (epoch, remaining)
+        skip_steps = self._prepare_resume_skip(epoch)
 
         for local_step_rel, _batch in enumerate(self.train_loader, 1):
             local_step = local_step_rel + skip_steps
@@ -377,7 +371,7 @@ class _FastSkipMockTrainer(_MockTrainer):
             self.global_step += 1
 
 
-def test_fast_skip_sampler_slice_avoids_skipped_getitem(
+def test_fast_resume_sampler_avoids_skipped_getitem(
     trained_steps: list[tuple[int, int, int]],
 ) -> None:
     """Fast-skip avoids __getitem__ calls for skipped batches."""
@@ -401,5 +395,257 @@ def test_fast_skip_sampler_slice_avoids_skipped_getitem(
         trainer.train_epoch(0)
 
         assert sampler.generated_for_epoch == 0
-        assert sampler._cached_generated_batches == (0, sampler.all_batches[3:])
+        assert sampler.remaining_batches(epoch=0, completed_batches=0) == tuple(
+            sampler.all_batches
+        )
         assert dataset.seen_indices == list(range(3, 10))
+
+
+class _IndexedDataset(Dataset):
+    def __init__(self, n_items: int) -> None:
+        self.n_items = n_items
+        self.seen_indices: list[int] = []
+
+    def __len__(self) -> int:
+        return self.n_items
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        self.seen_indices.append(index)
+        return {
+            "input_ids": torch.tensor([float(index + 1)]),
+            "document_ids": torch.tensor([0]),
+            "loss_mask": torch.tensor([1.0]),
+        }
+
+
+class _TwoHeadModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ordinary = nn.Parameter(torch.tensor([1.0]))
+        self.confidence_head = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            self.confidence_head.weight.fill_(2.0)
+
+    def forward(
+        self, input_ids: torch.Tensor, **_kwargs: torch.Tensor
+    ) -> tuple[None, torch.Tensor, dict[str, torch.Tensor]]:
+        values = input_ids.float()
+        prediction = values * self.ordinary + self.confidence_head(values)
+        loss = prediction.mean()
+        return None, loss, {"loss_sum": loss.detach(), "loss_count": loss.new_tensor(1)}
+
+
+def _make_real_loop_trainer(
+    tmp_path: Path,
+    *,
+    n_items: int,
+    max_steps: int,
+    num_epochs: int = 3,
+    observer: object | None = None,
+) -> tuple[Trainer, MultipackDistributedBatchSamplerV2, _IndexedDataset]:
+    dataset = _IndexedDataset(n_items)
+    sampler = MultipackDistributedBatchSamplerV2(
+        batch_max_length=1,
+        lengths=np.ones(n_items, dtype=np.int64),
+        num_replicas=1,
+        rank=0,
+        seed=23,
+    )
+    loader = DataLoader(dataset, batch_sampler=sampler)
+    model = _TwoHeadModel()
+    trainer = Trainer.__new__(Trainer)
+    trainer.model = cast("SpeculatorModel", model)
+    trainer.config = TrainerConfig(
+        save_path=str(tmp_path),
+        num_epochs=num_epochs,
+        lr=0.05,
+        resume_from_checkpoint=False,
+        checkpoint_freq=1,
+        log_freq=1,
+        scheduler_type="none",
+        hidden_states_dtype=torch.bfloat16,
+        max_steps=max_steps,
+    )
+    trainer.local_rank = "cpu"
+    trainer.rank = 0
+    trainer.train_loader = loader
+    trainer.val_loader = loader
+    trainer.is_distributed = False
+    trainer.resume_from_checkpoint = False
+    trainer.device_type = "cpu"
+    trainer.checkpointer = SingleGPUCheckpointer(str(tmp_path))
+    trainer.current_epoch = 0
+    trainer._resume_local_step = 0
+    trainer._resume_global_step = 0
+    trainer.global_step = 0
+    trainer.best_val_loss = float("inf")
+    trainer.optimizers = [torch.optim.SGD(model.parameters(), lr=0.05)]
+    trainer.schedulers = []
+    trainer.observer = observer
+    return trainer, sampler, dataset
+
+
+def test_resume_iterator_never_reads_skipped_dataset_items(tmp_path: Path) -> None:
+    """The sampler suffix must bypass every completed dataset item."""
+    trainer, sampler, dataset = _make_real_loop_trainer(
+        tmp_path, n_items=12, max_steps=12
+    )
+    del trainer
+    expected_suffix = sampler.remaining_batches(epoch=0, completed_batches=4)
+    sampler.resume_from_batch(epoch=0, completed_batches=4)
+
+    list(DataLoader(dataset, batch_sampler=sampler))
+
+    assert dataset.seen_indices == [int(batch[0]) for batch in expected_suffix]
+    assert len(sampler) == 12
+    assert len(sampler.remaining_batches(epoch=0, completed_batches=0)) == 12
+
+
+def test_max_steps_writes_exact_mid_epoch_checkpoint_and_exact_next_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 100 must be resumable without epoch-end publication or step 101."""
+    trainer, sampler, dataset = _make_real_loop_trainer(
+        tmp_path, n_items=120, max_steps=100
+    )
+
+    def fail_validation(_epoch: int) -> dict[str, float]:
+        raise AssertionError("partial epochs must not run validation")
+
+    checkpoint_epochs: list[int | str] = []
+    save_checkpoint = trainer.checkpointer.save_checkpoint
+
+    def track_checkpoint(
+        model: SpeculatorModel,
+        optimizers: list[torch.optim.Optimizer],
+        epoch: int | str,
+    ) -> None:
+        checkpoint_epochs.append(epoch)
+        save_checkpoint(model, optimizers, epoch)
+
+    monkeypatch.setattr(trainer.checkpointer, "save_checkpoint", track_checkpoint)
+    trainer.val_epoch = fail_validation  # type: ignore[method-assign]
+    result = trainer.run_training()
+
+    state = json.loads((tmp_path / "0" / "training_state.json").read_text())
+    assert state == {"epoch": 0, "local_step": 100, "global_step": 100}
+    assert trainer.global_step == 100
+    assert len(dataset.seen_indices) == 100
+    assert (tmp_path / "0" / SingleGPUCheckpointer.COMPLETE_MARKER_FILENAME).is_file()
+    assert (tmp_path / "epoch0_step100").is_symlink()
+    assert not (tmp_path / "epoch0_end").exists()
+    assert not (tmp_path / "1").exists()
+    assert checkpoint_epochs == [0]
+    assert result.checkpoint_epoch == 0
+    assert result.local_step == 100
+    assert result.global_step == 100
+
+    exact_next = sampler.remaining_batches(epoch=0, completed_batches=100)[0]
+    sampler.resume_from_batch(epoch=0, completed_batches=100)
+    np.testing.assert_array_equal(next(iter(sampler)), exact_next)
+
+
+def test_max_steps_already_reached_does_not_execute_an_extra_update(
+    tmp_path: Path,
+) -> None:
+    """A resumed process at its configured limit must not run step 101."""
+    trainer, _sampler, dataset = _make_real_loop_trainer(
+        tmp_path, n_items=120, max_steps=100
+    )
+    trainer.global_step = 100
+    trainer._resume_local_step = 100
+
+    result = trainer.train_epoch(0)
+
+    assert not result.completed_epoch
+    assert result.local_step == 100
+    assert trainer.global_step == 100
+    assert dataset.seen_indices == []
+
+
+class _RecordingObserver:
+    def __init__(self, model: _TwoHeadModel) -> None:
+        self.model = model
+        self.weights_during_callback: tuple[float, float] | None = None
+        self.evidence: list[object] = []
+
+    def after_backward(self, evidence: object) -> None:
+        self.weights_during_callback = (
+            float(self.model.ordinary.item()),
+            float(self.model.confidence_head.weight.item()),
+        )
+        self.evidence.append(evidence)
+
+
+def test_observer_receives_detached_post_clip_evidence_before_optimizer_step(
+    tmp_path: Path,
+) -> None:
+    """Evidence is scalar-only and observes clipped gradients before mutation."""
+    trainer, sampler, _dataset = _make_real_loop_trainer(
+        tmp_path, n_items=2, max_steps=1
+    )
+    model = cast("_TwoHeadModel", trainer.model)
+    observer = _RecordingObserver(model)
+    trainer.observer = observer
+    expected_sample = tuple(
+        int(index)
+        for index in sampler.remaining_batches(epoch=0, completed_batches=0)[0]
+    )
+
+    trainer.run_training()
+
+    assert observer.weights_during_callback == (1.0, 2.0)
+    assert (
+        float(model.ordinary.item()),
+        float(model.confidence_head.weight.item()),
+    ) != (
+        1.0,
+        2.0,
+    )
+    assert len(observer.evidence) == 1
+    evidence = observer.evidence[0]
+    assert evidence.epoch == 0
+    assert evidence.local_step == 1
+    assert evidence.global_step == 1
+    assert evidence.sample_indices == expected_sample
+    assert evidence.loss == pytest.approx(3.0 * (expected_sample[0] + 1))
+    assert evidence.ordinary_grad_l2 == pytest.approx(2**-0.5, rel=1e-5)
+    assert evidence.confidence_grad_l2 == pytest.approx(2**-0.5, rel=1e-5)
+    assert all(not isinstance(value, torch.Tensor) for value in vars(evidence).values())
+
+
+def test_observer_gradient_norms_reject_non_finite_values() -> None:
+    """Evidence must fail closed instead of publishing a misleading finite norm."""
+    model = _TwoHeadModel()
+    model.ordinary.grad = torch.tensor([float("nan")])
+    model.confidence_head.weight.grad = torch.tensor([[1.0]])
+
+    with pytest.raises(ValueError, match="non-finite gradient norm"):
+        trainer_module._gradient_l2_norms(
+            model,
+            is_distributed_run=False,
+            fsdp_shard=False,
+        )
+
+
+def test_public_run_training_threads_observer_and_returns_training_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The installed API exposes observer injection and its structured result."""
+    observer = object()
+    expected = object()
+    captured: list[object] = []
+
+    class _Session:
+        def run(self) -> object:
+            return expected
+
+    def build_session(_cfg: object, *, observer: object | None = None) -> _Session:
+        captured.append(observer)
+        return _Session()
+
+    monkeypatch.setattr(entrypoint_module, "_build_training_session", build_session)
+
+    assert entrypoint_module.run_training(object(), observer=observer) is expected
+    assert captured == [observer]
