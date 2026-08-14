@@ -26,7 +26,7 @@ Adapted from https://github.com/imoneoi/multipack_sampler.
 
 # Standard
 import warnings
-from heapq import heapreplace
+from heapq import heappush, heapreplace
 from typing import NamedTuple
 
 import numpy as np
@@ -42,6 +42,18 @@ class _Bin(NamedTuple):
 
     fill: int  # sum of items in _Bin
     slot: int  # heap slot id (0..num_replicas-1)
+
+
+class _TailDonor(NamedTuple):
+    length: int
+    distance_from_tail: int
+    logical_slot: int
+    shuffled_index: int
+    rotation: int
+
+
+class _PackingSearchExhaustedError(RuntimeError):
+    pass
 
 
 def _lpt_packed_batch(
@@ -69,12 +81,35 @@ def _lpt_packed_batch(
     correspond to `rank`.
     """
 
-    # Greedily assign lengths (in decreasing order) to the least full slot until they
-    # are all assigned or we run out of space.
     local_batch = []
     heap = [_Bin(0, i) for i in range(num_replicas)]
 
     target_slot = (rank - rotation) % num_replicas
+
+    indices = np.argsort(lengths)[::-1]
+    for idx, size in zip(indices, lengths[indices], strict=True):
+        new_fill = heap[0].fill + size
+        if new_fill > max_len:
+            return None
+
+        if heap[0].slot == target_slot:
+            local_batch.append(start_index + int(idx))
+
+        _ = heapreplace(heap, _Bin(new_fill, heap[0].slot))
+
+    return local_batch
+
+
+def _lpt_packed_slots(
+    lengths: np.ndarray,
+    max_len: int,
+    num_replicas: int,
+    start_index: int,
+) -> None | list[list[int]]:
+    """Pack one global batch and return every logical replica slot."""
+
+    local_batches: list[list[int]] = [[] for _ in range(num_replicas)]
+    heap = [_Bin(0, i) for i in range(num_replicas)]
 
     # sort in descending order
     indices = np.argsort(lengths)[::-1]
@@ -85,13 +120,258 @@ def _lpt_packed_batch(
             # Size doesn't fit in least full batch (or any others), report failure.
             return None
 
-        if heap[0].slot == target_slot:
-            # minimum bucket corresponds to this rank -> add idx to local batch
-            local_batch.append(start_index + idx)
+        local_batches[heap[0].slot].append(start_index + int(idx))
 
         _ = heapreplace(heap, _Bin(new_fill, heap[0].slot))
 
-    return local_batch
+    return local_batches
+
+
+def _exact_packed_groups(
+    *,
+    lengths: np.ndarray,
+    indices: list[int],
+    max_len: int,
+    num_groups: int,
+    node_limit: int = 100_000,
+) -> None | list[list[int]]:
+    """Exactly pack a small deterministic subset into nonempty token-limited groups."""
+
+    ordered = sorted(indices, key=lambda index: (-int(lengths[index]), index))
+    groups: list[list[int]] = [[] for _ in range(num_groups)]
+    fills = [0] * num_groups
+    visited: set[tuple[int, tuple[tuple[int, bool], ...]]] = set()
+    nodes = 0
+
+    def search(position: int) -> bool:
+        nonlocal nodes
+        nodes += 1
+        if nodes > node_limit:
+            raise _PackingSearchExhaustedError
+        if position == len(ordered):
+            return all(groups)
+
+        remaining = len(ordered) - position
+        if remaining < sum(not group for group in groups):
+            return False
+
+        state = (
+            position,
+            tuple(
+                sorted(
+                    (fills[slot], bool(groups[slot]))
+                    for slot in range(num_groups)
+                )
+            ),
+        )
+        if state in visited:
+            return False
+        visited.add(state)
+
+        index = ordered[position]
+        size = int(lengths[index])
+        equivalent_slots: set[tuple[int, bool]] = set()
+        for slot in sorted(range(num_groups), key=lambda item: (-fills[item], item)):
+            signature = (fills[slot], bool(groups[slot]))
+            if signature in equivalent_slots or fills[slot] + size > max_len:
+                continue
+            equivalent_slots.add(signature)
+            groups[slot].append(index)
+            fills[slot] += size
+            if search(position + 1):
+                return True
+            fills[slot] -= size
+            groups[slot].pop()
+        return False
+
+    if not search(0):
+        return None
+    return groups
+
+
+def _reconstruct_completed_slots(
+    *,
+    lengths: np.ndarray,
+    max_len: int,
+    replicas: int,
+    batch_range: tuple[int, int],
+) -> list[list[int]]:
+    batch_indices = np.arange(*batch_range)
+    local_slots = _lpt_packed_slots(
+        lengths=lengths[batch_indices],
+        max_len=max_len,
+        num_replicas=replicas,
+        start_index=0,
+    )
+    if local_slots is None:
+        raise ValueError("cannot reconstruct a completed sampler batch")
+    slots = [
+        [int(batch_indices[position]) for position in slot] for slot in local_slots
+    ]
+    if any(not slot for slot in slots):
+        raise ValueError("completed sampler batch has an empty rank")
+    return slots
+
+
+def _donor_candidates(
+    *,
+    lengths: np.ndarray,
+    slots: list[list[int]],
+    distance_from_tail: int,
+    rotation: int,
+) -> list[_TailDonor]:
+    candidates: list[_TailDonor] = []
+    for slot_index, slot in enumerate(slots):
+        keeper = max(
+            slot,
+            key=lambda index: (int(lengths[index]), -index),
+        )
+        candidates.extend(
+            _TailDonor(
+                length=int(lengths[index]),
+                distance_from_tail=distance_from_tail,
+                logical_slot=slot_index,
+                shuffled_index=index,
+                rotation=rotation,
+            )
+            for index in slot
+            if index != keeper
+        )
+    return candidates
+
+
+def _retained_rank_batch(
+    *,
+    slots: list[list[int]],
+    donor_indices: frozenset[int],
+    rank: int,
+    rotation: int,
+    replicas: int,
+    dtype: np.dtype,
+) -> NDArray:
+    target_slot = (rank - rotation) % replicas
+    retained = [index for index in slots[target_slot] if index not in donor_indices]
+    if not retained:
+        raise ValueError(
+            "cannot rebalance final sampler tail while keeping every rank nonempty"
+        )
+    return np.asarray(retained, dtype=dtype)
+
+
+def _retain_smallest_index(
+    *,
+    smallest: list[tuple[int, int, int]],
+    lengths: np.ndarray,
+    index: int,
+    limit: int,
+) -> None:
+    entry = (-int(lengths[index]), -index, index)
+    if len(smallest) < limit:
+        heappush(smallest, entry)
+        return
+    largest_key = (-smallest[0][0], -smallest[0][1])
+    if (int(lengths[index]), index) < largest_key:
+        heapreplace(smallest, entry)
+
+
+def _fold_tail_into_completed_suffix(
+    *,
+    lengths: np.ndarray,
+    max_len: int,
+    rank: int,
+    replicas: int,
+    completed_batch_ranges: list[tuple[int, int]],
+    tail_rotation: int,
+    dtype: np.dtype,
+) -> list[tuple[int, NDArray]]:
+    """Fold a tail into the smallest feasible completed suffix.
+
+    A suffix with ``K`` slots and ``K + E`` samples needs only ``E`` multi-sample
+    groups. If a packing exists, its grouped samples can be replaced by the ``2E``
+    smallest samples without increasing any group sum; every other sample is a
+    singleton. This keeps the exact search bounded by the replica count, not corpus
+    size.
+    """
+
+    smallest_limit = 2 * (replicas - 1)
+    smallest: list[tuple[int, int, int]] = []
+
+    tail_start = completed_batch_ranges[-1][1]
+    for index in range(tail_start, len(lengths)):
+        _retain_smallest_index(
+            smallest=smallest,
+            lengths=lengths,
+            index=index,
+            limit=smallest_limit,
+        )
+
+    suffix_size = len(lengths) - tail_start
+    search_exhausted = False
+    for start_rotation in range(len(completed_batch_ranges) - 1, -1, -1):
+        suffix_start, suffix_end = completed_batch_ranges[start_rotation]
+        suffix_size += suffix_end - suffix_start
+        for index in range(suffix_start, suffix_end):
+            _retain_smallest_index(
+                smallest=smallest,
+                lengths=lengths,
+                index=index,
+                limit=smallest_limit,
+            )
+
+        step_count = tail_rotation - start_rotation
+        slot_count = step_count * replicas
+        excess_count = suffix_size - slot_count
+        if excess_count <= 0 or excess_count >= replicas:
+            continue
+
+        selected = sorted(
+            (entry[2] for entry in smallest),
+            key=lambda index: (int(lengths[index]), index),
+        )[: 2 * excess_count]
+        try:
+            packed_groups = _exact_packed_groups(
+                lengths=lengths,
+                indices=selected,
+                max_len=max_len,
+                num_groups=excess_count,
+            )
+        except _PackingSearchExhaustedError:
+            search_exhausted = True
+            continue
+        if packed_groups is None:
+            continue
+
+        selected_set = frozenset(selected)
+        packed_slots = packed_groups + [
+            [index]
+            for index in range(suffix_start, len(lengths))
+            if index not in selected_set
+        ]
+        if len(packed_slots) != slot_count:
+            raise ValueError("invalid sampler suffix fold slot count")
+        packed_slots.sort(
+            key=lambda slot: (
+                -sum(int(lengths[index]) for index in slot),
+                tuple(slot),
+            )
+        )
+
+        replacements: list[tuple[int, NDArray]] = []
+        for step_offset in range(step_count):
+            rotation = start_rotation + step_offset
+            logical_slot = (rank - rotation) % replicas
+            flat_slot = step_offset * replicas + logical_slot
+            replacements.append(
+                (rotation, np.asarray(packed_slots[flat_slot], dtype=dtype))
+            )
+        return replacements
+
+    if search_exhausted:
+        raise ValueError(
+            "cannot rebalance final sampler tail because the bounded exact packing "
+            "search was exhausted"
+        )
+    raise ValueError("cannot rebalance final sampler tail within the token budget")
 
 
 def _rebalance_final_tail(
@@ -99,48 +379,105 @@ def _rebalance_final_tail(
     max_len: int,
     rank: int,
     replicas: int,
-    last_batch_indices: NDArray | None,
+    completed_batch_ranges: list[tuple[int, int]],
     tail_indices: NDArray,
     tail_rotation: int,
-) -> tuple[NDArray, NDArray]:
-    if last_batch_indices is None:
+) -> tuple[list[tuple[int, NDArray]], NDArray | None]:
+    if not completed_batch_ranges:
         raise ValueError("cannot rebalance final sampler tail without a previous batch")
 
     move_count = replicas - len(tail_indices)
-    if len(last_batch_indices) - move_count < replicas:
-        raise ValueError(
-            "cannot rebalance final sampler tail while keeping every rank nonempty"
+    donor_rotations: list[int] = []
+    donor_count = 0
+    for rotation in range(len(completed_batch_ranges) - 1, -1, -1):
+        batch_start, batch_end = completed_batch_ranges[rotation]
+        donor_rotations.append(rotation)
+        donor_count += batch_end - batch_start - replicas
+        if donor_count >= move_count:
+            break
+
+    if donor_count < move_count:
+        return (
+            _fold_tail_into_completed_suffix(
+                lengths=lengths,
+                max_len=max_len,
+                rank=rank,
+                replicas=replicas,
+                completed_batch_ranges=completed_batch_ranges,
+                tail_rotation=tail_rotation,
+                dtype=tail_indices.dtype,
+            ),
+            None,
         )
 
-    move_order = np.argsort(lengths[last_batch_indices], kind="stable")
-    moved_indices = last_batch_indices[move_order[:move_count]]
-    retained_indices = last_batch_indices[move_order[move_count:]]
-    rebalanced_tail = np.concatenate((tail_indices, moved_indices))
+    donor_candidates: list[_TailDonor] = []
+    for rotation in reversed(donor_rotations):
+        slots = _reconstruct_completed_slots(
+            lengths=lengths,
+            max_len=max_len,
+            replicas=replicas,
+            batch_range=completed_batch_ranges[rotation],
+        )
+        distance_from_tail = tail_rotation - rotation - 1
+        donor_candidates.extend(
+            _donor_candidates(
+                lengths=lengths,
+                slots=slots,
+                distance_from_tail=distance_from_tail,
+                rotation=rotation,
+            )
+        )
 
-    previous_batch = _lpt_packed_batch(
-        lengths[retained_indices],
-        max_len,
-        replicas,
-        0,
-        rank,
-        tail_rotation - 1,
+    donor_indices = tuple(
+        candidate.shuffled_index
+        for candidate in sorted(donor_candidates)[:move_count]
     )
-    tail_batch = _lpt_packed_batch(
+    donor_set = frozenset(donor_indices)
+    rebalanced_tail = np.concatenate(
+        (tail_indices, np.asarray(donor_indices, dtype=tail_indices.dtype))
+    )
+    tail_slots = _lpt_packed_slots(
         lengths[rebalanced_tail],
         max_len,
         replicas,
         0,
-        rank,
-        tail_rotation,
     )
-    if previous_batch is None or tail_batch is None:
+    if tail_slots is None:
         raise ValueError("cannot rebalance final sampler tail within the token budget")
-    if not previous_batch or not tail_batch:
+    if any(not slot for slot in tail_slots):
         raise ValueError(
             "cannot rebalance final sampler tail while keeping every rank nonempty"
         )
 
-    return retained_indices[previous_batch], rebalanced_tail[tail_batch]
+    selected_donors = sorted(donor_candidates)[:move_count]
+    replacement_rotations = sorted(
+        {candidate.rotation for candidate in selected_donors}
+    )
+    replacement_batches = [
+        (
+            rotation,
+            _retained_rank_batch(
+                slots=_reconstruct_completed_slots(
+                    lengths=lengths,
+                    max_len=max_len,
+                    replicas=replicas,
+                    batch_range=completed_batch_ranges[rotation],
+                ),
+                donor_indices=donor_set,
+                rank=rank,
+                rotation=rotation,
+                replicas=replicas,
+                dtype=tail_indices.dtype,
+            ),
+        )
+        for rotation in replacement_rotations
+    ]
+
+    tail_target_slot = (rank - tail_rotation) % replicas
+    tail_batch = rebalanced_tail[
+        np.asarray(tail_slots[tail_target_slot], dtype=np.int64)
+    ]
+    return replacement_batches, tail_batch
 
 
 def _assign_to_packed_batches(
@@ -162,11 +499,11 @@ def _assign_to_packed_batches(
         raises ``ValueError`` instead of being silently dropped.
     """
 
-    lengths_so_far = 0
-    ind = 0
+    lengths_so_far: int = 0
+    ind: int = 0
     result: list = []
     lengths_cumsum = np.cumsum(lengths)
-    last_batch_indices: NDArray | None = None
+    completed_batch_ranges: list[tuple[int, int]] = []
 
     # binary search for max integer x such that the next x elements in shuffled lengths
     # array can be packed into `replicas` batches.
@@ -176,24 +513,28 @@ def _assign_to_packed_batches(
             tail_indices = np.arange(ind, len(lengths))
             if len(tail_indices) == 0:
                 break
-            previous_batch, tail_batch = _rebalance_final_tail(
+            replacement_batches, tail_batch = _rebalance_final_tail(
                 lengths,
                 max_len,
                 rank,
                 replicas,
-                last_batch_indices,
+                completed_batch_ranges,
                 tail_indices,
                 len(result),
             )
-            result[-1] = previous_batch
-            result.append(tail_batch)
+            for rotation, batch in replacement_batches:
+                result[rotation] = batch
+            if tail_batch is not None:
+                result.append(tail_batch)
             break
 
         # binary search in [1, 1 + upper bound for x)
         batch_start = ind
         left = 1
-        right = 1 + np.searchsorted(
-            lengths_cumsum[ind:], lengths_so_far + max_len * replicas, "right"
+        right = 1 + int(
+            np.searchsorted(
+                lengths_cumsum[ind:], lengths_so_far + max_len * replicas, "right"
+            )
         )
 
         # Cycle the slot->rank mapping so no rank is permanently the many-samples one.
@@ -216,8 +557,8 @@ def _assign_to_packed_batches(
             )
 
         ind += left
-        lengths_so_far = lengths_cumsum[ind - 1]
-        last_batch_indices = np.arange(batch_start, ind)
+        lengths_so_far = int(lengths_cumsum[ind - 1])
+        completed_batch_ranges.append((batch_start, ind))
 
         # append only result for this rank (already filtered in lpt_packed_batch)
         result.append(batch)

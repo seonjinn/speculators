@@ -135,6 +135,160 @@ def test_final_tail_is_rebalanced_without_dropping_samples():
             assert int(lengths[batch].sum()) <= 2
 
 
+def test_final_tail_can_borrow_from_multiple_completed_batches():
+    replicas = 4
+    desired_shuffled_lengths = np.array(
+        [8192] * 8 + [16384] * 6,
+        dtype=np.int64,
+    )
+    permutation = np.random.default_rng(seed=0).permutation(
+        len(desired_shuffled_lengths)
+    )
+    lengths = np.empty_like(desired_shuffled_lengths)
+    lengths[permutation] = desired_shuffled_lengths
+
+    shards = [
+        list(
+            MultipackDistributedBatchSamplerV2(
+                batch_max_length=16384,
+                lengths=lengths,
+                num_replicas=replicas,
+                rank=rank,
+                seed=0,
+            )
+        )
+        for rank in range(replicas)
+    ]
+    flattened = [
+        int(index)
+        for rank_batches in shards
+        for batch in rank_batches
+        for index in batch
+    ]
+
+    assert sorted(flattened) == list(range(len(lengths)))
+    assert len(flattened) == len(set(flattened))
+    assert {len(rank_batches) for rank_batches in shards} == {3}
+    for rank_batches in shards:
+        for batch in rank_batches:
+            assert len(batch) > 0
+            assert int(lengths[batch].sum()) <= 16384
+
+
+def test_final_tail_can_fold_into_completed_suffix():
+    replicas = 2
+    desired_shuffled_lengths = np.array([5, 6, 7, 7, 5], dtype=np.int64)
+    permutation = np.random.default_rng(seed=0).permutation(
+        len(desired_shuffled_lengths)
+    )
+    lengths = np.empty_like(desired_shuffled_lengths)
+    lengths[permutation] = desired_shuffled_lengths
+
+    shards = [
+        list(
+            MultipackDistributedBatchSamplerV2(
+                batch_max_length=10,
+                lengths=lengths,
+                num_replicas=replicas,
+                rank=rank,
+                seed=0,
+            )
+        )
+        for rank in range(replicas)
+    ]
+    flattened = [
+        int(index)
+        for rank_batches in shards
+        for batch in rank_batches
+        for index in batch
+    ]
+
+    assert sorted(flattened) == list(range(len(lengths)))
+    assert len(flattened) == len(set(flattened))
+    assert {len(rank_batches) for rank_batches in shards} == {2}
+    for rank_batches in shards:
+        for batch in rank_batches:
+            assert len(batch) > 0
+            assert int(lengths[batch].sum()) <= 10
+
+
+def test_final_tail_suffix_uses_exact_reduced_packing_when_lpt_cannot_pack_it():
+    replicas = 4
+    desired_shuffled_lengths = np.array([6, 6, 3, 3, 2, 2, 2], dtype=np.int64)
+    permutation = np.random.default_rng(seed=0).permutation(
+        len(desired_shuffled_lengths)
+    )
+    lengths = np.empty_like(desired_shuffled_lengths)
+    lengths[permutation] = desired_shuffled_lengths
+
+    shards = [
+        list(
+            MultipackDistributedBatchSamplerV2(
+                batch_max_length=6,
+                lengths=lengths,
+                num_replicas=replicas,
+                rank=rank,
+                seed=0,
+            )
+        )
+        for rank in range(replicas)
+    ]
+    flattened = [
+        int(index)
+        for rank_batches in shards
+        for batch in rank_batches
+        for index in batch
+    ]
+
+    assert sorted(flattened) == list(range(len(lengths)))
+    assert len(flattened) == len(set(flattened))
+    assert {len(rank_batches) for rank_batches in shards} == {1}
+    for rank_batches in shards:
+        for batch in rank_batches:
+            assert len(batch) > 0
+            assert int(lengths[batch].sum()) <= 6
+
+
+def test_final_tail_reduced_exact_search_recovers_from_best_fit_failure():
+    replicas = 5
+    desired_shuffled_lengths = np.array(
+        [2, 2, 3, 3, 3, 5, 8, 8, 8],
+        dtype=np.int64,
+    )
+    permutation = np.random.default_rng(seed=0).permutation(
+        len(desired_shuffled_lengths)
+    )
+    lengths = np.empty_like(desired_shuffled_lengths)
+    lengths[permutation] = desired_shuffled_lengths
+
+    shards = [
+        list(
+            MultipackDistributedBatchSamplerV2(
+                batch_max_length=9,
+                lengths=lengths,
+                num_replicas=replicas,
+                rank=rank,
+                seed=0,
+            )
+        )
+        for rank in range(replicas)
+    ]
+    flattened = [
+        int(index)
+        for rank_batches in shards
+        for batch in rank_batches
+        for index in batch
+    ]
+
+    assert sorted(flattened) == list(range(len(lengths)))
+    assert len(flattened) == len(set(flattened))
+    assert {len(rank_batches) for rank_batches in shards} == {1}
+    for rank_batches in shards:
+        for batch in rank_batches:
+            assert len(batch) > 0
+            assert int(lengths[batch].sum()) <= 9
+
+
 def test_unrepresentable_final_tail_fails_instead_of_dropping_samples():
     sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=1,
