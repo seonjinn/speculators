@@ -1,8 +1,10 @@
 """Unit tests for data processing in speculators.train.data."""
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
 import torch
 from datasets import Dataset
 from safetensors.torch import save_file
@@ -489,6 +491,64 @@ def test_arrow_dataset_default_train_ratio_does_not_crash(tmp_path: Path):
     # Should not raise AttributeError
     assert arrow_ds._map_to_file_idx(0) == 0
     assert arrow_ds._map_to_file_idx(5) == 5
+
+
+def _save_arrow(
+    path: Path, *, actual: list[int], packing: Sequence[object] | None
+) -> None:
+    values: dict[str, object] = {
+        "input_ids": [list(range(length)) for length in actual],
+        "loss_mask": [[1] * length for length in actual],
+        "seq_len": actual,
+    }
+    if packing is not None:
+        values["packing_seq_len"] = packing
+    Dataset.from_dict(values).save_to_disk(str(path))
+
+
+def test_arrow_dataset_prefers_valid_packing_seq_len(tmp_path: Path) -> None:
+    path = tmp_path / "data"
+    _save_arrow(path, actual=[3, 5], packing=[7, 8])
+
+    dataset = ArrowDataset(max_len=8, datapath=path, on_missing="skip")
+
+    assert dataset.approx_lengths == [7, 8]
+    assert dataset.data[0]["seq_len"] == 3
+
+
+@pytest.mark.parametrize("packing", [[2, 5], [3, 9], [3, True]])
+def test_arrow_dataset_rejects_invalid_packing_seq_len(
+    tmp_path: Path, packing: list[object]
+) -> None:
+    path = tmp_path / "data"
+    _save_arrow(path, actual=[3, 5], packing=packing)
+
+    with pytest.raises(ValueError, match="packing_seq_len"):
+        ArrowDataset(max_len=8, datapath=path, on_missing="skip")
+
+
+def test_arrow_dataset_uses_seq_len_without_packing_seq_len(tmp_path: Path) -> None:
+    path = tmp_path / "data"
+    _save_arrow(path, actual=[3, 5], packing=None)
+
+    dataset = ArrowDataset(max_len=8, datapath=path, on_missing="skip")
+
+    assert dataset.approx_lengths == [3, 5]
+
+
+def test_arrow_dataset_validates_only_selected_split_rows(tmp_path: Path) -> None:
+    path = tmp_path / "data"
+    _save_arrow(path, actual=[3, 5], packing=[3, 9])
+
+    dataset = ArrowDataset(
+        max_len=8,
+        datapath=path,
+        on_missing="skip",
+        train_ratio=0.5,
+        split="train",
+    )
+
+    assert dataset.approx_lengths == [3]
 
 
 def test_arrow_dataset_on_generate_cache_creates_hidden_states_dir(tmp_path: Path):
