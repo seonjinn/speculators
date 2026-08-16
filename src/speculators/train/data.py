@@ -270,8 +270,27 @@ class ArrowDataset(BaseDataset):
         return len(self.data)
 
     def _compute_approx_lengths(self) -> list[int]:
-        """Get lengths of the dataset samples."""
-        return list(self.data.with_format(None)["seq_len"])
+        """Return validated sampler lengths without changing physical row lengths."""
+        plain = self.data.with_format(None)
+        actual = list(plain["seq_len"])
+        packing = (
+            list(plain["packing_seq_len"])
+            if "packing_seq_len" in plain.column_names
+            else actual
+        )
+        if len(actual) != len(packing):
+            raise ValueError("packing_seq_len must contain one value per dataset row")
+        for index, (seq_len, packing_len) in enumerate(
+            zip(actual, packing, strict=True)
+        ):
+            if type(seq_len) is not int or type(packing_len) is not int:
+                raise ValueError(f"packing_seq_len row {index} must use plain integers")
+            if not 0 < seq_len <= packing_len <= self.max_len:
+                raise ValueError(
+                    f"packing_seq_len row {index} must satisfy "
+                    "0 < seq_len <= packing_seq_len <= max_len"
+                )
+        return packing
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
         if not self.client:
