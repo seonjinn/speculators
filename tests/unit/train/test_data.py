@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from datasets import Dataset
+from datasets import Dataset, Features, Value
 from safetensors.torch import save_file
 
 from speculators.models.eagle3.data import shift_batch
@@ -503,7 +503,19 @@ def _save_arrow(
     }
     if packing is not None:
         values["packing_seq_len"] = packing
-    Dataset.from_dict(values).save_to_disk(str(path))
+    if packing is not None and any(type(value) is bool for value in packing):
+        dataset = Dataset.from_dict(
+            {
+                "packing_seq_len": [bool(value) for value in packing],
+            },
+            features=Features({"packing_seq_len": Value("bool")}),
+        )
+        dataset = Dataset.from_dict(
+            {key: value for key, value in values.items() if key != "packing_seq_len"}
+        ).add_column("packing_seq_len", dataset["packing_seq_len"])
+    else:
+        dataset = Dataset.from_dict(values)
+    dataset.save_to_disk(str(path))
 
 
 def test_arrow_dataset_prefers_valid_packing_seq_len(tmp_path: Path) -> None:
