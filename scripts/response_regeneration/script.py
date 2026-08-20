@@ -7,10 +7,14 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from datasets import load_dataset
@@ -23,8 +27,10 @@ from speculators.data_generation.vllm_client import (
     InvalidResponseError,
     with_retries,
 )
+from speculators.provenance import find_repo_root, git_sha, run_git
 
 logger = logging.getLogger(__name__)
+_ACTIVE_RUN_MANIFEST: dict[str, Any] = {}
 
 # On-policy regeneration has no multimodal support yet. Users can generate
 # multimodal target responses externally and then convert those conversations
@@ -59,7 +65,7 @@ def ensure_parent_dirs(*paths: str) -> None:
             os.makedirs(parent, exist_ok=True)
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     """Parse command-line arguments for the script."""
     parser = argparse.ArgumentParser(
         description="Regenerate dataset responses via a vLLM Chat API endpoint."
@@ -93,6 +99,24 @@ def parse_args():
             "Dataset subset/config name "
             "(auto-detected from dataset config if not specified)"
         ),
+    )
+    parser.add_argument(
+        "--data-files",
+        nargs="+",
+        default=None,
+        help="Local Parquet files to use instead of downloading the preset dataset",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Number of deterministic data shards",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Zero-based deterministic shard to process",
     )
     parser.add_argument("--limit", type=int, default=None, help="Stop after N rows")
     parser.add_argument(
@@ -139,9 +163,18 @@ def parse_args():
             f"(default: {DEFAULT_MAX_RETRIES})"
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.max_retries < 0:
         parser.error("--max-retries must be >= 0")
+    if args.num_shards < 1:
+        parser.error("--num-shards must be >= 1")
+    if not 0 <= args.shard_index < args.num_shards:
+        parser.error("--shard-index must satisfy 0 <= index < --num-shards")
+    for data_file in args.data_files or []:
+        if not data_file.lower().endswith(".parquet"):
+            parser.error(f"--data-files only accepts Parquet files: {data_file}")
+        if not os.path.isfile(data_file):
+            parser.error(f"--data-files path is not a file: {data_file}")
     try:
         args.sampling_params = (
             json.loads(args.sampling_params) if args.sampling_params else {}
@@ -158,6 +191,171 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[/\\:*?"<>|]', "_", name)
     name = name.replace(" ", "_")
     return name.strip("._")
+
+
+def _load_input_dataset(
+    *,
+    data_files: list[str] | None,
+    dataset_id: str,
+    subset: str | None,
+    split: str,
+):
+    """Stream either explicit local Parquet files or the preset HF dataset."""
+    if data_files:
+        return load_dataset(
+            "parquet",
+            data_files={"train": data_files},
+            split="train",
+            streaming=True,
+        )
+    return load_dataset(dataset_id, name=subset, split=split, streaming=True)
+
+
+_SECRET_NAME_RE = re.compile(r"(?:api[-_]?key|token|password|secret)", re.IGNORECASE)
+_ARGV_REDACT_VALUE_OPTIONS = {"--sampling-params"}
+
+
+def _sanitize_url(value: str) -> str:
+    """Redact URL credentials and secret-looking query parameters."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if not parsed.scheme or not parsed.netloc:
+        return value
+    hostname = parsed.hostname or ""
+    if parsed.port is not None:
+        hostname = f"{hostname}:{parsed.port}"
+    netloc = f"<redacted>@{hostname}" if parsed.username else hostname
+    query = urlencode(
+        [
+            (key, "<redacted>" if _SECRET_NAME_RE.search(key) else item_value)
+            for key, item_value in parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+    )
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+
+
+def _sanitize_argv(argv: list[str]) -> list[str]:
+    """Return argv with secret-valued options redacted."""
+    sanitized: list[str] = []
+    redact_next = False
+    for value in argv:
+        if redact_next:
+            sanitized.append("<redacted>")
+            redact_next = False
+            continue
+        if value.startswith("--") and "=" in value:
+            option, option_value = value.split("=", 1)
+            if _SECRET_NAME_RE.search(option) or option in _ARGV_REDACT_VALUE_OPTIONS:
+                sanitized.append(f"{option}=<redacted>")
+            else:
+                sanitized.append(f"{option}={_sanitize_url(option_value)}")
+            continue
+        sanitized.append(_sanitize_url(value))
+        redact_next = value.startswith("--") and (
+            bool(_SECRET_NAME_RE.search(value)) or value in _ARGV_REDACT_VALUE_OPTIONS
+        )
+    return sanitized
+
+
+def _sanitize_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _sanitize_mapping(value)
+    if isinstance(value, list):
+        return [_sanitize_value(item) for item in value]
+    return value
+
+
+def _sanitize_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: ("<redacted>" if _SECRET_NAME_RE.search(key) else _sanitize_value(value))
+        for key, value in mapping.items()
+    }
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_manifest_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as manifest_file:
+            json.dump(payload, manifest_file, indent=2, sort_keys=True)
+            manifest_file.write("\n")
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _start_run_manifest(
+    path: Path, args: argparse.Namespace, argv: list[str]
+) -> dict[str, Any]:
+    repo_root = find_repo_root(Path(__file__))
+    slurm_names = {
+        "SLURM_JOB_ID": "job_id",
+        "SLURM_ARRAY_JOB_ID": "array_job_id",
+        "SLURM_ARRAY_TASK_ID": "array_task_id",
+    }
+    manifest = {
+        "status": "running",
+        "started_at": _utc_now(),
+        "ended_at": None,
+        "speculators": {
+            "git_sha": git_sha(repo_root),
+            "dirty": bool(run_git(["git", "status", "--porcelain"], repo_root))
+            if repo_root
+            else False,
+        },
+        "argv": _sanitize_argv(argv),
+        "data_files": [
+            {
+                "path": data_file,
+                "resolved_blob_basename": Path(data_file).resolve().name,
+                "size_bytes": Path(data_file).stat().st_size,
+            }
+            for data_file in args.data_files or []
+        ],
+        "sharding": {
+            "num_shards": args.num_shards,
+            "shard_index": args.shard_index,
+            "hash_algorithm": "sha256(primary_id_utf8)_mod_num_shards",
+        },
+        "model": args.model,
+        "endpoint": _sanitize_url(args.endpoint),
+        "sampling_params": _sanitize_mapping(args.sampling_params),
+        "max_tokens": args.max_tokens,
+        "concurrency": args.concurrency,
+        "slurm": {
+            output_name: os.environ[input_name]
+            for input_name, output_name in slurm_names.items()
+            if input_name in os.environ
+        },
+    }
+    _write_manifest_atomic(path, manifest)
+    return manifest
+
+
+def _finish_run_manifest(path: Path, manifest: dict[str, Any], *, status: str) -> None:
+    manifest["status"] = status
+    manifest["ended_at"] = _utc_now()
+    _write_manifest_atomic(path, manifest)
+
+
+def _fail_active_run_manifest() -> None:
+    if not _ACTIVE_RUN_MANIFEST:
+        return
+    path = _ACTIVE_RUN_MANIFEST["path"]
+    manifest = _ACTIVE_RUN_MANIFEST["manifest"]
+    _finish_run_manifest(path, manifest, status="failed")
+    _ACTIVE_RUN_MANIFEST.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +520,22 @@ def _primary_identifier(row: dict[str, Any]) -> str:
         if _is_present(value):
             return str(value)
     return _content_hash(row)
+
+
+def _primary_id_shard(primary_id: str, num_shards: int) -> int:
+    """Map a stable primary id to a deterministic shard."""
+    digest = hashlib.sha256(primary_id.encode("utf-8")).digest()
+    return int.from_bytes(digest, byteorder="big") % num_shards
+
+
+def _iter_shard_rows(
+    dataset: Iterable[dict[str, Any]], num_shards: int, shard_index: int
+) -> Iterator[tuple[int, dict[str, Any], str]]:
+    """Yield source-indexed rows assigned to one stable primary-id shard."""
+    for source_index, row in enumerate(dataset):
+        primary_id = _primary_identifier(row)
+        if _primary_id_shard(primary_id, num_shards) == shard_index:
+            yield source_index, row, primary_id
 
 
 def load_seen(path: str) -> set[str]:
@@ -762,9 +976,6 @@ async def main():
 
     print(f"Using model: {args.model}")
 
-    # Decoder for the review-only `text` twin; see build_detokenizer.
-    detokenize = build_detokenizer(args.model)
-
     # Get dataset configuration
     dataset_config = DATASET_CONFIGS[args.dataset]
     dataset_id = dataset_config.hf_path
@@ -780,6 +991,13 @@ async def main():
         model_name = sanitize_filename(model_name)
         args.outfile = f"{args.dataset}_{model_name}.jsonl"
 
+    manifest_path = Path(f"{args.outfile}.manifest.json")
+    manifest = _start_run_manifest(manifest_path, args, sys.argv)
+    _ACTIVE_RUN_MANIFEST.update(path=manifest_path, manifest=manifest)
+
+    # Decoder for the review-only `text` twin; see build_detokenizer.
+    detokenize = build_detokenizer(args.model)
+
     # Failed / partial conversations are written here instead of the training file.
     base, ext = os.path.splitext(args.outfile)
     error_outfile = f"{base}.errors{ext or '.jsonl'}"
@@ -792,7 +1010,12 @@ async def main():
     print()
 
     seen_ids = load_seen(args.outfile) if args.resume else set()
-    dataset = load_dataset(dataset_id, name=subset, split=split, streaming=True)
+    dataset = _load_input_dataset(
+        data_files=args.data_files,
+        dataset_id=dataset_id,
+        subset=subset,
+        split=split,
+    )
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
 
@@ -847,7 +1070,9 @@ async def main():
             ]
 
             processed_count = 0
-            for index, row in enumerate(dataset):
+            for index, row, primary_id in _iter_shard_rows(
+                dataset, args.num_shards, args.shard_index
+            ):
                 if args.limit is not None and processed_count >= args.limit:
                     break
 
@@ -859,7 +1084,6 @@ async def main():
                     continue
                 normalized, turns, tool_results = prepared
 
-                primary_id = _primary_identifier(row)
                 if primary_id in seen_ids:
                     continue
 
@@ -907,9 +1131,16 @@ async def main():
 
             _log_summary(stats)
 
+    _finish_run_manifest(manifest_path, manifest, status="completed")
+    _ACTIVE_RUN_MANIFEST.clear()
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        _fail_active_run_manifest()
         sys.exit(130)
+    except BaseException:
+        _fail_active_run_manifest()
+        raise

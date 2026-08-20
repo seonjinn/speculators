@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from datasets import Dataset
 
 from speculators.data_generation import vllm_client
 from speculators.data_generation.configs import DATASET_CONFIGS, DatasetConfig
@@ -49,6 +50,146 @@ def _load_regen_module():
 
 
 regen = _load_regen_module()
+
+
+def test_parse_args_accepts_local_parquet_shard(tmp_path):
+    part_0 = tmp_path / "part-000.parquet"
+    part_1 = tmp_path / "part-001.parquet"
+    part_0.touch()
+    part_1.touch()
+
+    args = regen.parse_args(
+        [
+            "--dataset",
+            "open-perfectblend",
+            "--data-files",
+            str(part_0),
+            str(part_1),
+            "--num-shards",
+            "4",
+            "--shard-index",
+            "2",
+        ]
+    )
+
+    assert args.data_files == [str(part_0), str(part_1)]
+    assert args.num_shards == 4
+    assert args.shard_index == 2
+
+
+@pytest.mark.parametrize(
+    "shard_args",
+    [
+        ["--num-shards", "0"],
+        ["--shard-index", "-1"],
+        ["--num-shards", "4", "--shard-index", "4"],
+    ],
+)
+def test_parse_args_rejects_invalid_shard_range(shard_args):
+    with pytest.raises(SystemExit):
+        regen.parse_args(shard_args)
+
+
+def test_parse_args_rejects_missing_or_non_parquet_data_files(tmp_path):
+    json_file = tmp_path / "rows.jsonl"
+    json_file.touch()
+
+    with pytest.raises(SystemExit):
+        regen.parse_args(["--data-files", str(tmp_path / "missing.parquet")])
+    with pytest.raises(SystemExit):
+        regen.parse_args(["--data-files", str(json_file)])
+
+
+def test_load_input_dataset_streams_all_local_parquet_files(tmp_path):
+    part_0 = tmp_path / "part-000.parquet"
+    part_1 = tmp_path / "part-001.parquet"
+    Dataset.from_list([{"id": "a"}]).to_parquet(part_0)
+    Dataset.from_list([{"id": "b"}]).to_parquet(part_1)
+
+    dataset = regen._load_input_dataset(
+        data_files=[str(part_0), str(part_1)],
+        dataset_id="unused/preset",
+        subset="unused",
+        split="chat",
+    )
+
+    assert [row["id"] for row in dataset] == ["a", "b"]
+
+
+def test_run_manifest_records_reproducible_shard_and_redacts_secrets(
+    tmp_path, monkeypatch
+):
+    blob = tmp_path / "af60f3c18201652a"
+    blob.write_bytes(b"parquet-bytes")
+    lexical_path = tmp_path / "part-000.parquet"
+    lexical_path.symlink_to(blob)
+    outfile = tmp_path / "shard-2.jsonl"
+    manifest_path = tmp_path / "shard-2.jsonl.manifest.json"
+    args = argparse.Namespace(
+        data_files=[str(lexical_path)],
+        num_shards=4,
+        shard_index=2,
+        model="Qwen/Qwen3-30B-A3B",
+        endpoint="http://127.0.0.1:8000/v1/chat/completions",
+        sampling_params={
+            "temperature": 0.7,
+            "extra": [{"api_key": "sampling-secret"}],
+        },
+        max_tokens=4096,
+        concurrency=64,
+        outfile=str(outfile),
+    )
+    monkeypatch.setenv("SLURM_JOB_ID", "1234")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-be-recorded")
+
+    manifest = regen._start_run_manifest(
+        manifest_path,
+        args,
+        [
+            "script.py",
+            "--api-key",
+            "super-secret",
+            "--token=also-secret",
+            "--sampling-params",
+            '{"api_key":"argv-secret"}',
+        ],
+    )
+    regen._finish_run_manifest(manifest_path, manifest, status="completed")
+
+    written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert written["status"] == "completed"
+    assert written["started_at"]
+    assert written["ended_at"]
+    assert len(written["speculators"]["git_sha"]) == 40
+    int(written["speculators"]["git_sha"], 16)
+    assert isinstance(written["speculators"]["dirty"], bool)
+    assert written["argv"] == [
+        "script.py",
+        "--api-key",
+        "<redacted>",
+        "--token=<redacted>",
+        "--sampling-params",
+        "<redacted>",
+    ]
+    assert written["data_files"] == [
+        {
+            "path": str(lexical_path),
+            "resolved_blob_basename": blob.name,
+            "size_bytes": len(b"parquet-bytes"),
+        }
+    ]
+    assert written["sharding"] == {
+        "num_shards": 4,
+        "shard_index": 2,
+        "hash_algorithm": "sha256(primary_id_utf8)_mod_num_shards",
+    }
+    assert written["sampling_params"] == {
+        "temperature": 0.7,
+        "extra": [{"api_key": "<redacted>"}],
+    }
+    assert written["slurm"] == {"job_id": "1234"}
+    assert "must-not-be-recorded" not in manifest_path.read_text(encoding="utf-8")
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +427,24 @@ def test_primary_identifier_falls_back_to_content_hash():
     assert regen._primary_identifier({"question": "other"}) != pid
     # A nested metadata id is not used as a source.
     assert regen._primary_identifier({"metadata": {"sample_id": 7}}).startswith("hash_")
+
+
+@pytest.mark.parametrize(
+    ("primary_id", "expected_shard"),
+    [("row-a", 1), ("row-b", 2), ("abc", 1)],
+)
+def test_primary_id_shard_is_sha256_modulo(primary_id, expected_shard):
+    assert regen._primary_id_shard(primary_id, num_shards=4) == expected_shard
+
+
+def test_iter_shard_rows_partitions_by_stable_primary_id():
+    rows = [{"id": "row-a"}, {"id": "row-b"}, {"id": "abc"}]
+
+    shard_1 = list(regen._iter_shard_rows(rows, num_shards=4, shard_index=1))
+    shard_2 = list(regen._iter_shard_rows(rows, num_shards=4, shard_index=2))
+
+    assert shard_1 == [(0, rows[0], "row-a"), (2, rows[2], "abc")]
+    assert shard_2 == [(1, rows[1], "row-b")]
 
 
 def test_load_seen_missing_file_returns_empty(tmp_path):

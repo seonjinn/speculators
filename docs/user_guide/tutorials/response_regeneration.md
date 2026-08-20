@@ -177,6 +177,14 @@ python scripts/response_regeneration/script.py \
   --resume
 ```
 
+For large local Parquet datasets, independent workers can use `--data-files`,
+`--num-shards`, and `--shard-index`. Assignment is a stable SHA256 hash of each
+conversation's `primary_id`; give every shard its own output file and reuse the
+same arguments with `--resume`. See the
+[CLI reference](/cli/response_regeneration.md#parallel-local-parquet-example)
+for a complete command. Each output also gets an atomically updated
+`.manifest.json` provenance sidecar.
+
 ### Keeping the Server Running
 
 Use `--keep-server` with `run_all.sh` to leave the vLLM server running after processing, useful when running multiple regeneration jobs:

@@ -83,6 +83,12 @@ python scripts/response_regeneration/script.py --dataset magpie
 
 - **`--subset`** (str, default: preset-specific) Dataset subset/config name. Defaults to the preset's subset.
 
+- **`--data-files`** (one or more paths, default: `None`) Stream explicit local Parquet files instead of downloading the preset dataset. The preset still selects normalization and filtering behavior.
+
+- **`--num-shards`** (int, default: `1`) Number of deterministic parallel shards.
+
+- **`--shard-index`** (int, default: `0`) Zero-based shard handled by this process. Rows are assigned with `SHA256(primary_id UTF-8) modulo num_shards`, so assignment is stable across input ordering and resume runs.
+
 - **`--limit`** (int, default: `None`) Stop after N rows.
 
 - **`--language-filter`** (str, default: `None`) Only process rows where language matches this value (e.g., `EN`).
@@ -109,6 +115,8 @@ python scripts/response_regeneration/script.py --dataset magpie
 
 - **`--resume`** (flag) Skip conversations already present in the output file (matched by `primary_id`: the row's `id`/`uuid` if it has one, otherwise a content hash).
 
+Each run atomically maintains `<outfile>.manifest.json` with sanitized arguments, source revision and dirty state, local file identities and sizes, shard parameters, generation settings, lifecycle status, and available SLURM job identifiers. It does not copy arbitrary environment variables or hash large Parquet files.
+
 ### Full Example
 
 ```bash
@@ -121,6 +129,22 @@ python scripts/response_regeneration/script.py \
   --outfile magpie_Llama-3.3-70B-Instruct.jsonl \
   --resume
 ```
+
+### Parallel Local-Parquet Example
+
+Launch one process per shard with a distinct output file. For shard 2 of 4:
+
+```bash
+python scripts/response_regeneration/script.py \
+  --dataset open-perfectblend \
+  --data-files /datasets/open-perfectblend/*.parquet \
+  --num-shards 4 \
+  --shard-index 2 \
+  --outfile outputs/open-perfectblend.shard-2-of-4.jsonl \
+  --resume
+```
+
+Do not point multiple shards at the same output file. Interrupted shards can be rerun independently with the same shard arguments and `--resume`.
 
 ## Supported Datasets
 
