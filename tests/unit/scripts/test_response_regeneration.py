@@ -130,10 +130,21 @@ def test_run_manifest_records_reproducible_shard_and_redacts_secrets(
         num_shards=4,
         shard_index=2,
         model="Qwen/Qwen3-30B-A3B",
-        endpoint="http://127.0.0.1:8000/v1/chat/completions",
+        endpoint=(
+            "https://user:password@example.com/v1/chat/completions"
+            "?authorization=endpoint-secret#access_token=fragment-secret"
+        ),
         sampling_params={
             "temperature": 0.7,
-            "extra": [{"api_key": "sampling-secret"}],
+            "extra": [
+                {
+                    "api_key": "sampling-secret",
+                    "Authorization": "authorization-secret",
+                    "COOKIE": "cookie-secret",
+                    "Session": "session-secret",
+                    "max_tokens": 128,
+                }
+            ],
         },
         max_tokens=4096,
         concurrency=64,
@@ -185,11 +196,99 @@ def test_run_manifest_records_reproducible_shard_and_redacts_secrets(
     }
     assert written["sampling_params"] == {
         "temperature": 0.7,
-        "extra": [{"api_key": "<redacted>"}],
+        "extra": [
+            {
+                "api_key": "<redacted>",
+                "Authorization": "<redacted>",
+                "COOKIE": "<redacted>",
+                "Session": "<redacted>",
+                "max_tokens": 128,
+            }
+        ],
     }
+    assert written["endpoint"] == (
+        "https://<redacted>@example.com/v1/chat/completions"
+        "?authorization=%3Credacted%3E"
+    )
     assert written["slurm"] == {"job_id": "1234"}
-    assert "must-not-be-recorded" not in manifest_path.read_text(encoding="utf-8")
+    serialized = manifest_path.read_text(encoding="utf-8")
+    for secret in (
+        "must-not-be-recorded",
+        "endpoint-secret",
+        "fragment-secret",
+        "sampling-secret",
+        "authorization-secret",
+        "cookie-secret",
+        "session-secret",
+    ):
+        assert secret not in serialized
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_sanitize_url_redacts_userinfo_sensitive_query_and_fragment():
+    endpoint = (
+        "https://alice:password@example.com:8443/v1/chat/completions"
+        "?temperature=0.7&Authorization=Bearer%20query-secret"
+        "#access_token=fragment-secret"
+    )
+
+    assert regen._sanitize_url(endpoint) == (
+        "https://<redacted>@example.com:8443/v1/chat/completions"
+        "?temperature=0.7&Authorization=%3Credacted%3E"
+    )
+
+
+def test_sanitizers_redact_nested_credentials_and_preserve_non_secrets():
+    sampling_params = {
+        "temperature": 0.7,
+        "nested": [
+            {
+                "Authorization": "Bearer nested-secret",
+                "authorization_header": "Bearer header-secret",
+                "COOKIE": "cookie-secret",
+                "accessToken": "access-token-secret",
+                "Session": "session-secret",
+                "max_tokens": 128,
+                "session_timeout": 30,
+            }
+        ],
+    }
+
+    assert regen._sanitize_mapping(sampling_params) == {
+        "temperature": 0.7,
+        "nested": [
+            {
+                "Authorization": "<redacted>",
+                "authorization_header": "<redacted>",
+                "COOKIE": "<redacted>",
+                "accessToken": "<redacted>",
+                "Session": "<redacted>",
+                "max_tokens": 128,
+                "session_timeout": 30,
+            }
+        ],
+    }
+    assert regen._sanitize_argv(
+        [
+            "script.py",
+            "--AUTHORIZATION",
+            "Bearer argv-secret",
+            "--cookie=cookie-secret",
+            "--max-tokens",
+            "4096",
+            "--session-timeout",
+            "30",
+        ]
+    ) == [
+        "script.py",
+        "--AUTHORIZATION",
+        "<redacted>",
+        "--cookie=<redacted>",
+        "--max-tokens",
+        "4096",
+        "--session-timeout",
+        "30",
+    ]
 
 
 # ---------------------------------------------------------------------------

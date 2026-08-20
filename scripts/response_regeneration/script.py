@@ -211,8 +211,54 @@ def _load_input_dataset(
     return load_dataset(dataset_id, name=subset, split=split, streaming=True)
 
 
-_SECRET_NAME_RE = re.compile(r"(?:api[-_]?key|token|password|secret)", re.IGNORECASE)
+_SECRET_NAMES = {
+    "accesstoken",
+    "apikey",
+    "auth",
+    "authtoken",
+    "authorization",
+    "bearer",
+    "bearertoken",
+    "clientsecret",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "password",
+    "passwd",
+    "privatekey",
+    "proxyauthorization",
+    "refreshtoken",
+    "secret",
+    "session",
+    "sessionid",
+    "sessionkey",
+    "sessiontoken",
+    "setcookie",
+    "token",
+}
+_SECRET_NAME_SUFFIXES = (
+    "_api_key",
+    "_authorization",
+    "_cookie",
+    "_password",
+    "_passwd",
+    "_secret",
+    "_session",
+    "_session_id",
+    "_token",
+)
 _ARGV_REDACT_VALUE_OPTIONS = {"--sampling-params"}
+
+
+def _is_secret_name(name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
+    collapsed = normalized.replace("_", "")
+    return (
+        collapsed in _SECRET_NAMES
+        or normalized.startswith(("authorization_", "cookie_", "set_cookie_"))
+        or normalized.endswith(_SECRET_NAME_SUFFIXES)
+    )
 
 
 def _sanitize_url(value: str) -> str:
@@ -229,11 +275,11 @@ def _sanitize_url(value: str) -> str:
     netloc = f"<redacted>@{hostname}" if parsed.username else hostname
     query = urlencode(
         [
-            (key, "<redacted>" if _SECRET_NAME_RE.search(key) else item_value)
+            (key, "<redacted>" if _is_secret_name(key) else item_value)
             for key, item_value in parse_qsl(parsed.query, keep_blank_values=True)
         ]
     )
-    return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
 
 
 def _sanitize_argv(argv: list[str]) -> list[str]:
@@ -247,14 +293,14 @@ def _sanitize_argv(argv: list[str]) -> list[str]:
             continue
         if value.startswith("--") and "=" in value:
             option, option_value = value.split("=", 1)
-            if _SECRET_NAME_RE.search(option) or option in _ARGV_REDACT_VALUE_OPTIONS:
+            if _is_secret_name(option) or option in _ARGV_REDACT_VALUE_OPTIONS:
                 sanitized.append(f"{option}=<redacted>")
             else:
                 sanitized.append(f"{option}={_sanitize_url(option_value)}")
             continue
         sanitized.append(_sanitize_url(value))
         redact_next = value.startswith("--") and (
-            bool(_SECRET_NAME_RE.search(value)) or value in _ARGV_REDACT_VALUE_OPTIONS
+            _is_secret_name(value) or value in _ARGV_REDACT_VALUE_OPTIONS
         )
     return sanitized
 
@@ -269,7 +315,7 @@ def _sanitize_value(value: Any) -> Any:
 
 def _sanitize_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: ("<redacted>" if _SECRET_NAME_RE.search(key) else _sanitize_value(value))
+        key: ("<redacted>" if _is_secret_name(key) else _sanitize_value(value))
         for key, value in mapping.items()
     }
 
